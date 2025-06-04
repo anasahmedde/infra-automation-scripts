@@ -1,0 +1,49 @@
+# This workflow routinely scales down beta-blue and space-blue clusters
+name: Blue Cluster Downscaling
+
+on:
+    workflow_dispatch:
+    schedule:
+        - cron: '00 15 * * *'  # 7:00PM DXB time, Daily
+
+jobs:
+    downscaling:
+        runs-on: [self-hosted, dbz-runner-amd-v2-small]
+        strategy:
+            fail-fast: false
+            matrix:
+              k8-cluster-name: [beta-blue-eks-cluster, space-blue-eks-cluster]
+
+        steps:
+            - name: Clean Container 📦🧹
+              uses: dbz/actions-clean@v2
+
+            - name: Checkout repository 👀
+              uses: actions/checkout@v3
+              with:
+                clean: true
+                persist-credentials: false
+
+            - name: Configure AWS Credentials 💳
+              uses: aws-actions/configure-aws-credentials@v1
+              with:
+                role-to-assume: arn:aws:iam::857520607940:role/CrossAccount_EKS_for_MENAOps
+                aws-region: eu-west-1
+                role-skip-session-tagging: true
+                role-duration-seconds: 3600
+
+            - name: Downscale Node Groups ⬇️
+              run: |
+                echo "Fetching node groups..."
+                nodegroups=$(aws eks list-nodegroups --cluster-name ${{ matrix.k8-cluster-name }} --query 'nodegroups[*]' --output text)
+                for node_group in $nodegroups; do
+                    tags=$(aws eks describe-nodegroup --cluster-name ${{ matrix.k8-cluster-name }} --nodegroup-name $node_group --query 'nodegroup.tags')
+                    scaling_enabled=$(echo $tags | jq -r '.scaling')
+                    if [ "$scaling_enabled" = "enabled" ]; then
+                        echo "Scaling node group: $node_group"
+                        aws eks update-nodegroup-config --cluster-name ${{ matrix.k8-cluster-name }} --nodegroup-name $node_group --scaling-config minSize=0,maxSize=1,desiredSize=0
+                        echo "Node group $node_group scaled down ✅"
+                    else
+                        echo "Skipping node group $node_group as scaling is not enabled"
+                    fi
+                done

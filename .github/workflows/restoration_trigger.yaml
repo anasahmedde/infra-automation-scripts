@@ -1,0 +1,181 @@
+# This workflow routinely triggers restoration of beta enviornments from space
+name: Beta Restoration
+run-name: >-
+  ${{ github.event.schedule == '00 19 * * 6' && 'Restoration - Scale Up Environments' ||
+    github.event.schedule == '25 19 * * 6' && 'Restoration - Create Space Snapshot' ||
+    github.event.schedule == '55 20 * * 6' && 'Restoration - Trigger Restoration' ||
+    github.event.schedule == '30 21 * * 6' && 'Restoration - Bulk Deploy Applications' ||
+    github.event.schedule == '00 22 * * 6' && 'Restoration - Scale Down Environments & Delete Space Snapshots' }}
+
+on:
+    schedule:
+        - cron: '00 19 * * 6'  # 11:00PM DXB time, Saturday
+        - cron: '25 19 * * 6'  # 11:25PM DXB time, Saturday
+        - cron: '55 20 * * 6'  # 12:55AM DXB time, Saturday
+        - cron: '30 21 * * 6'  # 1:30AM DXB time, Sunday
+        - cron: '00 22 * * 6'  # 2:00AM DXB time, Sunday
+
+jobs:
+
+    restoration-sequence:
+        runs-on: [self-hosted, dbz-runner-amd-v2-small]
+        steps:
+
+        - name: Clean Container 📦🧹
+          uses: dbz/actions-clean@v2
+
+        - name: Checkout repository 👀
+          uses: actions/checkout@v3
+          with:
+            clean: true
+            persist-credentials: false
+            token: ${{ secrets.GH_ACCESS_TOKEN}}
+
+        - name: Clean SSH key 🧹🔑
+          uses: JesseTG/rm@v1.0.2
+          with:
+            path: /home/ec2-user/.ssh/id_rsa
+
+        - name: Install SSH key 🔐
+          uses: shimataro/ssh-key-action@v2
+          with:
+            key: ${{ secrets.SSH_KEY }}
+            name: id_rsa
+            known_hosts: ${{ secrets.KNOWN_HOSTS }}
+
+        # Do not modify this array unless an env is created or destroyed
+        - name: Define Array of All Environments 🫥
+          run: |
+            all_environments=beta-bid,beta-cc,beta-me,beta-nl,beta-pro,beta-pw,beta-red
+            echo "all_environments=$all_environments" >> $GITHUB_ENV
+            echo $all_environments
+
+
+        - name: Exclude Environments from Restoration 😶‍🌫️
+          run: |
+
+            # Modify this to remove an environment from scheduled scaling action
+            export excluded_environments=beta-bid,beta-cc,beta-nl,beta-pro,beta-pw,beta-red,beta-me
+            echo "excluded_environments=$excluded_environments" >> $GITHUB_ENV
+
+
+        - name: Set Environments for Restoration 😃
+          run: |
+            environments="$all_environments"
+            IFS=',' read -ra excluded_env_array <<< "$excluded_environments"
+            for excluded_env in "${excluded_env_array[@]}"; do
+                echo "Removing excluded environment: $excluded_env"
+                # Remove the excluded environment from the environments list
+                environments=$(echo "$environments" | sed "s/\b$excluded_env\b//g")
+            done
+
+            # Remove any extra commas or spaces
+            environments=$(echo "$environments" | sed 's/,\+/,/g' | sed 's/^,//' | sed 's/,$//')
+
+            echo "Environments after removal: $environments"
+            echo "environments=$environments" >> $GITHUB_ENV
+
+        #11.00PM - Sat
+        - name: Trigger Environment Scale Up ⬆️
+          if: github.event.schedule == '00 19 * * 6'
+          run: |
+            environments="${environments},dev-space"
+            IFS=',' read -r -a environments <<< "${environments}"
+            for environment in "${environments[@]}"; do
+                curl -L \
+                  -X POST \
+                  -H "Accept: application/vnd.github+json" \
+                  -H "Authorization: Bearer ${{ secrets.BUILDOPS_TOKEN }}" \
+                  -H "X-GitHub-Api-Version: 2022-11-28" \
+                  https://api.github.com/repos/dbz/infra-automation/actions/workflows/environment_scaling.yaml/dispatches \
+                  -d '{"ref":"main","inputs":{"environment":"'"${environment}"'","scaling_action":"up"}}'
+            done
+
+        #11.25PM - Sat
+        - name: Create Space Snapshot - Saturday Night
+          if: github.event.schedule == '25 19 * * 6'
+          run: |
+            curl -L \
+              -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${{ secrets.BUILDOPS_TOKEN }}" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              https://api.github.com/repos/dbz/terraform-dbz-beta/actions/workflows/create_snapshot.yaml/dispatches \
+              -d '{"ref":"main"}'
+
+        #12.55AM - Sat
+        - name: Trigger Environment Restoration 🥡
+          if: github.event.schedule == '55 20 * * 6'
+          run: |
+            IFS=',' read -r -a environments <<< "${environments}"
+            for environment in "${environments[@]}"; do
+                curl -L \
+                -X POST \
+                -H "Accept: application/vnd.github+json" \
+                -H "Authorization: Bearer ${{ secrets.BUILDOPS_TOKEN }}" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                https://api.github.com/repos/dbz/terraform-dbz-beta/actions/workflows/6498615/dispatches \
+                -d '{"ref":"main", "inputs": { "beta_env":"'"${environment}"'"}}'
+            done
+
+        #1.30AM - Sun
+        - name: Trigger Bulk Deploy of Applications 💡
+          if: github.event.schedule == '30 21 * * 6'
+          run: |
+            export gh_pat=${{ secrets.BUILDOPS_TOKEN }}
+            bash restoration_scripts/bulk_deploy.sh
+
+        # #2.00AM - Sun
+        # - name: Trigger Data Copy Pipeline to Dump [schema + data]
+        #   if: github.event.schedule == '00 22 * * 6'
+        #   run: |
+        #     curl -L \
+        #     -X POST \
+        #     -H "Accept: application/vnd.github+json" \
+        #     -H "Authorization: Bearer ${{ secrets.BUILDOPS_TOKEN }}" \
+        #     -H "X-GitHub-Api-Version: 2022-11-28" \
+        #     https://api.github.com/repos/dbz/infra-automation/actions/workflows/data_copy_prod_dump_orchestrator.yml/dispatches \
+        #     -d '{"ref":"main", "inputs": { "Environment":"prod" }}'
+
+        # #2.30AM - Sun
+        # - name: Trigger Data Copy Pipeline to Restore [schema + data] for all env
+        #   if: github.event.schedule == '30 22 * * 6'
+        #   run: |
+        #     IFS=',' read -r -a environments <<< "${environments}"
+        #     for environment in "${environments[@]}"; do
+        #         curl -L \
+        #         -X POST \
+        #         -H "Accept: application/vnd.github+json" \
+        #         -H "Authorization: Bearer ${{ secrets.BUILDOPS_TOKEN }}" \
+        #         -H "X-GitHub-Api-Version: 2022-11-28" \
+        #         https://api.github.com/repos/dbz/infra-automation/actions/workflows/data_copy_lower_env_restore_orchestrator.yml/dispatches \
+        #         -d '{"ref":"main", "inputs": { "Environment":"'"${environment}"'", "SOURCE_S3_BUCKET":"dbz-data-copy-prod" }}'
+        #     done
+
+        #2.00AM - Sun
+        - name: Scale Environments Down ⬇️
+          if: github.event.schedule == '00 22 * * 6'
+          run: |
+            environments="${environments},dev-space"
+            IFS=',' read -r -a environments <<< "${environments}"
+            for environment in "${environments[@]}"; do
+                curl -L \
+                -X POST \
+                -H "Accept: application/vnd.github+json" \
+                -H "Authorization: Bearer ${{ secrets.BUILDOPS_TOKEN }}" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                https://api.github.com/repos/dbz/infra-automation/actions/workflows/environment_scaling.yaml/dispatches \
+                -d '{"ref":"main", "inputs": { "environment":"'"${environment}"'", "scaling_action":"down"}}'
+            done
+
+        #2.00AM - Sun
+        - name: Delete Space Snapshot - Sunday Morning
+          if: github.event.schedule == '00 22 * * 6'
+          run: |
+            curl -L \
+              -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${{ secrets.BUILDOPS_TOKEN }}" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              https://api.github.com/repos/dbz/terraform-dbz-beta/actions/workflows/delete_snapshot.yaml/dispatches \
+              -d '{"ref":"main"}'

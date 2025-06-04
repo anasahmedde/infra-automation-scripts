@@ -1,0 +1,341 @@
+name: Beta Scaling
+run-name: Scaling ${{ inputs.environment }} ${{ inputs.scaling_action }}
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: 'Select an environment to scale'
+        required: true
+        type: string
+      scaling_action:
+        description: 'Choose the scaling action'
+        required: true
+        type: string
+
+jobs:
+
+  scaling-job:
+    runs-on: [self-hosted, dbz-runner-arm-v2-small]
+    steps:
+
+      - name: Clean Container 📦🧹
+        uses: dbz/actions-clean@v2
+
+      - name: Configure AWS Credentials 💳
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: arn:aws:iam::857520607940:role/CrossAccount_EKS_for_MENAOps
+          aws-region: eu-west-1
+          role-skip-session-tagging: true
+          role-duration-seconds: 3600
+
+      - name: Set Environment Variables
+        if: github.event_name != 'push'
+        run: |
+          region=eu-west-1
+          echo "region=$region" >> $GITHUB_ENV
+
+          environment=${{ inputs.environment }}
+          echo "environment=$environment" >> $GITHUB_ENV
+
+          scaling_action=${{ inputs.scaling_action }}
+          echo "scaling_action=$scaling_action" >> $GITHUB_ENV
+
+          cluster_name=beta-eks-cluster
+          echo "cluster_name=$cluster_name" >> $GITHUB_ENV
+
+          # Define all beta environments
+          beta_environments=("beta-bid" "beta-cc" "beta-me" "beta-nl" "beta-pro" "beta-pw" "beta-red")
+          echo "beta_environments=${beta_environments[@]}" >> $GITHUB_ENV
+
+          # Initialize scale_ops_down flag to true
+          scale_ops_down=true
+          echo "scale_ops_down=$scale_ops_down" >> $GITHUB_ENV
+
+      # SLACK NOTIFICATION STEPS
+      - name: Get username
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          username="${{ github.actor }}"
+          user_response=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" "https://api.github.com/users/$username")
+          USER_NAME=$(echo "$user_response" | jq -r '.name')
+          # Check if USER_NAME is empty or null
+          if [ -z "$USER_NAME" ] || [ "$USER_NAME" == "null" ]; then
+              USER_NAME="$username"
+          fi
+          echo "USER_NAME=$USER_NAME" >> $GITHUB_ENV
+          echo "User Name: $USER_NAME"
+
+      - name: Get Slack ID
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          actor=${{ github.actor }}
+          response=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+          "https://api.github.com/repos/${{ github.repository }}/commits?sha=${{ github.ref }}")
+          email=$(echo "$response" | jq --arg actor "$actor" -r 'first(.[] | select(.author.login == $actor) | .commit.author.email)')
+          echo $email
+          if [ -z $email ]; then
+              USER_ID=false
+              echo "USER_ID=$USER_ID" >> $GITHUB_ENV
+          else
+              echo "email=$email" >> GITHUB_ENV
+              slack_profile=$(curl -s -H "Authorization: Bearer ${{ secrets.SLACK_API_TOKEN }}" \
+              "https://slack.com/api/users.lookupByEmail?email=${email}")
+              ok=$(echo $slack_profile | jq -r '.ok')
+              if [[ $ok == "true" ]]; then
+                  USER_ID=$(echo $slack_profile | jq -r '.user.id')
+                  echo "USER_ID=$USER_ID" >> $GITHUB_ENV
+              else
+                  USER_ID=false
+                  echo "USER_ID=$USER_ID" >> $GITHUB_ENV
+              fi
+          fi
+
+      - name: Manual Scaling Slack Notification (tagged)
+        uses: slackapi/slack-github-action@v1.25.0
+        if: github.event_name == 'workflow_dispatch' && env.USER_ID != 'false'
+        continue-on-error: true
+        with:
+          channel-id: C0232T0LP7V
+          slack-message: "💸 *Environment Scaling Notification* - <@${{ env.USER_ID }}> <https://github.com/dbz/infra-automation/actions/runs/${{ github.run_id }}|triggered scale ${{ env.scaling_action }} for> ${{ env.environment }}. Please wait as it will take about 10-15 minutes to completely scale ${{ env.scaling_action }} 🙂"
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+      - name: Manual Scaling Slack Notification (untagged)
+        uses: slackapi/slack-github-action@v1.25.0
+        if: github.event_name == 'workflow_dispatch' && env.USER_ID == 'false'
+        continue-on-error: true
+        with:
+          channel-id: C0232T0LP7V
+          slack-message: "💸 *Environment Scaling Notification* - ${{ env.USER_NAME }} <https://github.com/dbz/infra-automation/actions/runs/${{ github.run_id }}|triggered scale ${{ env.scaling_action }} for> ${{ env.environment }}. Please wait as it will take about 10-15 minutes to completely scale ${{ env.scaling_action }} 🙂"
+        env:
+            SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+      - name: Bot Activity Slack Notification
+        uses: slackapi/slack-github-action@v1.25.0
+        if: github.event_name != 'workflow_dispatch'
+        with:
+          channel-id: C0232T0LP7V
+          slack-message: "💸 *Environment Scaling Notification* - `Autoscaling` <https://github.com/dbz/infra-automation/actions/runs/${{ github.run_id }}|triggered scale ${{ env.scaling_action }} for> ${{ env.environment }}"
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+      # SCALE SPECIFIC BETA ENV ASG
+      - name: Get ASG Name
+        run: |
+          # Get the Auto Scaling group name based on the environment name in the tag eks:nodegroup-name
+          asg_name=$(aws autoscaling describe-auto-scaling-groups \
+          --query "AutoScalingGroups[?Tags[?Key=='eks:nodegroup-name' && contains(Value, '${{ env.environment }}')] && Tags[?Key=='eks:cluster-name' && Value=='${{ env.cluster_name }}']].AutoScalingGroupName" \
+          --region ${{ env.region }} --output text)
+
+          echo "asg_name=$asg_name" >> $GITHUB_ENV
+
+          # Check if the Auto Scaling group was found
+          if [ -z "$asg_name" ]; then
+              curl -X POST -H 'Content-type: application/json' --data "{\"text\":\"An error occured while scaling ${{ env.environment }} down as no associated ASG could be found\"}" ${{ secrets.DB_TESTING_SLACK_WEBHOOK }}
+              echo "No Auto Scaling group found with the environment name '${{ env.environment }}'."
+              exit 1
+          fi
+
+      - name: Scale ASG Up
+        if: env.scaling_action == 'up'
+        run: |
+          # Loop through each ASG and set min, max and desired to 3
+          for asg_name in ${{ env.asg_name }}; do
+            echo "Scaling ASG: $asg_name"
+            aws autoscaling update-auto-scaling-group \
+              --auto-scaling-group-name "$asg_name" \
+              --min-size 3 \
+              --max-size 3 \
+              --desired-capacity 3 \
+              --region "${{ env.region }}"
+            echo "Scaled Auto Scaling group '$asg_name' to min=3, max=3, desired=3."
+          done
+
+      - name: Scale ASG Down
+        if: env.scaling_action == 'down'
+        run: |
+          # Loop through each ASG and set min, max and desired to 0
+          for asg_name in ${{ env.asg_name }}; do
+            echo "Scaling ASG: $asg_name"
+            aws autoscaling update-auto-scaling-group \
+              --auto-scaling-group-name "$asg_name" \
+              --min-size 0 \
+              --max-size 0 \
+              --desired-capacity 0 \
+              --region "${{ env.region }}"
+            echo "Scaled Auto Scaling group '$asg_name' to min=0, max=0, desired=0."
+          done
+
+      # SCALE RDS
+      - name: Get RDS Instances
+        run: |
+          instances=$(aws rds describe-db-instances --region "${{ env.region }}" \
+            --query "DBInstances[?TagList[?Key=='scaling' && Value=='enabled'] && TagList[?Key=='environment' && Value=='${{ env.environment }}']].DBInstanceIdentifier" \
+            --output text)
+          echo "instances=$instances" >> $GITHUB_ENV
+
+      - name: Scale RDS Up
+        if: env.scaling_action == 'up'
+        run: |
+          timeout=300  # 5 minutes in seconds
+          interval=15  # Check every 15 seconds
+
+          # Loop through each instance and scale it up
+          for instance in ${{ env.instances }}; do
+            elapsed=0
+            while [ $elapsed -lt $timeout ]; do
+              current_state=$(aws rds describe-db-instances --region "${{ env.region }}" \
+                --db-instance-identifier "$instance" \
+                --query "DBInstances[0].DBInstanceStatus" --output text)
+
+              if [ "$current_state" == "stopped" ]; then
+                echo "Starting RDS instance $instance in region ${{ env.region }}... 🟢"
+                aws rds start-db-instance --region "${{ env.region }}" --db-instance-identifier "$instance"
+                break
+
+              elif [ "$current_state" == "available" ] || [ "$current_state" == "starting" ]; then
+                echo "RDS instance $instance is already in $current_state state."
+                break
+
+              # Handling the case wherein a scale up is triggered immediately after a scale down
+              else
+                echo "RDS instance $instance is in state $current_state. Continuing to wait..."
+              fi
+
+              sleep $interval
+              elapsed=$((elapsed + interval))
+            done
+
+            if [ "$current_state" != "stopped" ] && [ "$current_state" != "available" ] && [ "$current_state" != "starting" ]; then
+              curl -X POST -H 'Content-type: application/json' --data "{\"text\":\"An error occured while scaling $instance up as it is currently in the $current_state state\"}" ${{ secrets.DB_TESTING_SLACK_WEBHOOK }}
+              echo "Could not initiate scale up since RDS instance $instance did not reach stopped state within the timeout period. Current state: $current_state"
+            fi
+          done
+
+      - name: Scale RDS Down
+        if: env.scaling_action == 'down'
+        run: |
+          timeout=300  # 5 minutes in seconds
+          interval=15  # Check every 15 seconds
+
+          # Loop through each instance and scale it up
+          for instance in ${{ env.instances }}; do
+            elapsed=0
+            while [ $elapsed -lt $timeout ]; do
+              current_state=$(aws rds describe-db-instances --region "${{ env.region }}" \
+                --db-instance-identifier "$instance" \
+                --query "DBInstances[0].DBInstanceStatus" --output text)
+
+              if [ "$current_state" == "available" ]; then
+                echo "Stopping RDS instance $instance in region "${{ env.region }}"...🔴"
+                aws rds stop-db-instance --region "${{ env.region }}" --db-instance-identifier "$instance"
+                break
+
+              elif [ "$current_state" == "stopped" ] || [ "$current_state" == "stopping" ]; then
+                echo "RDS instance $instance is already in $current_state state."
+                break
+
+              # Handling the case wherein a scale down is triggered immediately after a scale up
+              else
+                echo "RDS instance $instance is in state $current_state. Continuing to wait..."
+              fi
+
+              sleep $interval
+              elapsed=$((elapsed + interval))
+            done
+
+            if [ "$current_state" != "available" ] && [ "$current_state" != "stopped" ] && [ "$current_state" != "stopping" ]; then
+              curl -X POST -H 'Content-type: application/json' --data "{\"text\":\"An error occured while scaling $instance down as it is currently in the $current_state state\"}" ${{ secrets.DB_TESTING_SLACK_WEBHOOK }}
+              echo "Could not initiate scale down since RDS instance $instance did not reach available state within the timeout period. Current state: $current_state"
+            fi
+          done
+
+      # SCALE BETA OPS ASG
+      - name: Get Beta-Ops ASG Name
+        run: |
+          # Get the Auto Scaling group name based on the environment name in the tag eks:nodegroup-name
+          beta_ops_asg_name=$(aws autoscaling describe-auto-scaling-groups \
+          --query "AutoScalingGroups[?Tags[?Key=='eks:nodegroup-name' && contains(Value, 'ops')] && Tags[?Key=='eks:cluster-name' && Value=='${{ env.cluster_name }}']].AutoScalingGroupName" \
+          --region ${{ env.region }} --output text)
+          echo "beta_ops_asg_name=$beta_ops_asg_name" >> $GITHUB_ENV
+
+          # Check if the Auto Scaling group was found
+          if [ -z "$beta_ops_asg_name" ]; then
+              echo "No Auto Scaling group found with the environment name 'beta-ops'."
+              curl -X POST -H 'Content-type: application/json' --data "{\"text\":\"An error occured while scaling beta-ops since no associated ASGs were found\"}" ${{ secrets.DB_TESTING_SLACK_WEBHOOK }}
+              exit 1
+          fi
+
+      - name: Scale Beta-Ops ASG Up
+        if: env.scaling_action == 'up'
+        run: |
+          # Loop through each ASG and set min, max and desired to 2
+          for asg_name in ${{ env.beta_ops_asg_name }}; do
+            echo "Scaling ASG: $asg_name"
+            aws autoscaling update-auto-scaling-group \
+              --auto-scaling-group-name "$asg_name" \
+              --min-size 1 \
+              --max-size 3 \
+              --desired-capacity 2 \
+              --region "${{ env.region }}"
+            echo "Scaled Auto Scaling group '$asg_name' to min=1, max=3, desired=2."
+          done
+
+      - name: Check if Beta-Ops ASG Should be Scaled Down
+        if: env.scaling_action == 'down'
+        run: |
+          for environment in ${{ env.beta_environments }}; do
+            echo "Checking ASGs for environment: $environment"
+
+            # Get the ASG names for the environment
+            asg_names=$(aws autoscaling describe-auto-scaling-groups \
+            --query "AutoScalingGroups[?Tags[?Key=='eks:nodegroup-name' && contains(Value, '$environment')] && Tags[?Key=='eks:cluster-name' && Value=='${{ env.cluster_name }}']].AutoScalingGroupName" \
+            --region ${{ env.region }} --output text)
+
+
+            if [ -z "$asg_names" ]; then
+              echo "No ASG found for environment: $environment"
+              continue
+            fi
+
+            # Loop through each ASG and check maxSize
+            for asg_name in $asg_names; do
+              echo "Checking ASG: $asg_name"
+
+              # Get the maxSize of the ASG
+              max_size=$(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$asg_name" --query "AutoScalingGroups[0].MaxSize" --region ${{ env.region }} --output text)
+
+              if [ "$max_size" -ne 0 ]; then
+                echo "ASG $asg_name has maxSize=$max_size, setting scale_ops_down to false."
+                scale_ops_down=false
+                echo "scale_ops_down=$scale_ops_down" >> $GITHUB_ENV
+                exit 0  # Exit early since we found an ASG with non-zero maxSize
+              fi
+            done
+          done
+
+      - name: Scale Beta-Ops ASG Down
+        if: env.scaling_action == 'down' && env.scale_ops_down == 'true'
+        run: |
+          # Loop through each ASG and set min, max and desired to 0
+          for asg_name in ${{ env.beta_ops_asg_name }}; do
+            echo "Scaling ASG: $asg_name"
+            aws autoscaling update-auto-scaling-group \
+              --auto-scaling-group-name "$asg_name" \
+              --min-size 0 \
+              --max-size 0 \
+              --desired-capacity 0 \
+              --region "${{ env.region }}"
+            echo "Scaled Auto Scaling group '$asg_name' to min=0, max=0, desired=0."
+          done
+
+      - name: Slack Notification on Scaling Failure
+        uses: slackapi/slack-github-action@v1.25.0
+        if: failure()
+        with:
+          channel-id: C0232T0LP7V
+          slack-message: "Something went wrong while scaling ${{ env.environment }} ${{ env.scaling_action }} ⚠️"
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}

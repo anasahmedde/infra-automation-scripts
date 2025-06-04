@@ -1,0 +1,145 @@
+name: Restart Rollouts & Deployments
+
+on:
+  workflow_call:
+    inputs:
+      service_name:
+        required: true
+        type: string
+      environment:
+        required: false
+        default: 'dev-space'
+        type: string
+      justification:
+        description: 'Justification (reason for restarting rollouts/deployments)'
+        required: true
+        type: string
+
+jobs:
+
+  rollout-restart:
+    # runs-on: [self-hosted, dbz-runner-amd-v2-small] #use this runner for testing changes
+    runs-on: [self-hosted, dbz-infra-runner-amd-v2]
+
+    steps:
+      - name: Clean Container 📦🧹
+        uses: dbz/actions-clean@v2
+
+      - name: Clean SSH key 🧹🔑
+        uses: JesseTG/rm@v1.0.2
+        with:
+          path: /home/ec2-user/.ssh/id_rsa
+
+      - name: Install SSH key 🔐
+        uses: shimataro/ssh-key-action@v2
+        with:
+          key: ${{ secrets.SSH_KEY }}
+          name: id_rsa
+          known_hosts: ${{ secrets.KNOWN_HOSTS }}
+
+      - name: Audit Action 🔍
+        run: |
+          echo ' 👨‍🎓 ${{ github.actor }} is going to restart ${{ inputs.service_name}} rollouts and deployments on ${{ env.environment }}. Justification: ${{ inputs.justification }}'
+
+      - name: Clone Infra-Automation 👷🏼‍♂️
+        if: ${{ inputs.environment == 'prod' }}
+        run: |
+          git clone -b main git@github.com:dbz/infra-automation.git
+
+      - name: Initialize Logging Variables 🤖
+        if: ${{ inputs.environment == 'prod' }}
+        run: |
+          event_payload=$(cat $GITHUB_EVENT_PATH)
+          inputs_string=$(echo "$event_payload" | jq -r '.inputs | to_entries | map("\(.key)=\(.value|tostring)") | join(",")')
+          echo "INPUT_PARAMETERS=$inputs_string" >> $GITHUB_ENV
+          echo "SERVICE_NAME=${{ inputs.service_name }}" >> $GITHUB_ENV
+          echo "USER=${{ github.actor }}" >> $GITHUB_ENV
+          echo "WORKFLOW_EXECUTED=${{ github.workflow }}" >> $GITHUB_ENV
+          echo "LINK_TO_EXECUTION=https://github.com/${{ github.repository }}/actions/runs/${GITHUB_RUN_ID}" >> $GITHUB_ENV
+          echo "MESSAGE=${{ github.actor }} is going to restart deployments and rollout for service ${{ inputs.application }}" >> $GITHUB_ENV
+
+      - name: Send request to OpenSearch 📤
+        if: ${{ inputs.environment == 'prod' }}
+        run: |
+          bash infra-automation/elk_logging/send_logs_to_elk.sh
+
+      - name: Intialize Environment Specific Variables 🪴
+        run: |
+          # This step initializes environment dependent variables
+          if [[ "${{ inputs.environment }}" == "prod" ]]; then
+            echo "K8S_CONTEXT=arn:aws:eks:eu-west-1:847754352879:cluster/prod-eks-cluster" >> $GITHUB_ENV
+            echo "ROLE_TO_ASSUME=arn:aws:iam::847754352879:role/CrossAccount_EKS_for_MENAOps" >> $GITHUB_ENV
+            echo "ENV=${{ inputs.environment }}" >> $GITHUB_ENV
+          elif [[ "${{ inputs.environment }}" == "dev-space" ]]; then
+            echo "K8S_CONTEXT=arn:aws:eks:me-central-1:857520607940:cluster/space-gold-eks-cluster" >> $GITHUB_ENV
+            echo "ROLE_TO_ASSUME=arn:aws:iam::857520607940:role/CrossAccount_EKS_for_MENAOps" >> $GITHUB_ENV
+            echo "ENV=${{ inputs.environment }}" >> $GITHUB_ENV
+          fi
+
+      - name: Set Rollout Names 🤫
+        run: |
+          # This step handles edge cases where the service name is different from the rollout name or deployment label
+          if [[ "${{ inputs.service_name }}" == "monolith" ]]; then
+            ROLLOUT=dbzuae-web
+            echo "ROLLOUT=$ROLLOUT" >> $GITHUB_ENV
+          elif [[ "${{ inputs.service_name }}" == "vas-dbz-cars" ]]; then
+            ROLLOUT=vas-dbz-cars-blog
+            echo "ROLLOUT=$ROLLOUT" >> $GITHUB_ENV
+          elif [[ "${{ inputs.service_name }}" == "horizontal-buyer-service" ]]; then
+            ROLLOUT=horizontal-buyer
+            echo "ROLLOUT=$ROLLOUT" >> $GITHUB_ENV
+          else
+            ROLLOUT=${{ inputs.service_name }}
+            echo "ROLLOUT=$ROLLOUT" >> $GITHUB_ENV
+          fi
+
+      - name: Configure AWS Credentials 🤐
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-skip-session-tagging: true
+          aws-region: eu-west-1
+          role-to-assume: "${{env.ROLE_TO_ASSUME}}"
+          role-duration-seconds: 14400
+
+     # Install kubectl and kubectl argo cli
+      - name: Install Kubectl ⬇️
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+
+      - name: Configure Kubectl 🔐
+        uses: azure/k8s-set-context@v3
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.KUBE_CONFIG }}
+          context: ${{ env.K8S_CONTEXT }}
+
+      - name: Install kubectl-argo CLI 🛠️
+        run: |
+          curl -LO https://github.com/argoproj/argo-rollouts/releases/latest/download/kubectl-argo-rollouts-linux-amd64
+          chmod +x ./kubectl-argo-rollouts-linux-amd64
+          sudo mv ./kubectl-argo-rollouts-linux-amd64 /usr/local/bin/kubectl-argo-rollouts
+          kubectl argo rollouts version
+
+      - name: Restart K8 Deployments 🔄
+        run: |
+          echo "Restarting deployments..."
+          kubectl get deployments -n ${{ env.ENV }} -l dbz.com/service_name=${{ inputs.service_name }} | awk 'NR>1' | while read -r line; do
+            DEPLOYMENT=$(echo $line | awk '{print $1}')
+            echo "Restarting deployment: $DEPLOYMENT"
+            kubectl rollout restart deployment $DEPLOYMENT -n ${{ env.ENV }}
+          done
+
+      - name: Restart Argo Rollouts 🔁
+        run: |
+          echo "Restarting rollout: ${{ env.ROLLOUT }}"
+          if kubectl argo rollouts restart ${{ env.ROLLOUT }} -n ${{ env.ENV }}; then
+            echo "Rollout restarted successfully"
+            while ! kubectl argo rollouts get rollout ${{ env.ROLLOUT }} -n ${{ env.ENV }} | grep -q "Healthy"; do
+              kubectl argo rollouts get rollout ${{ env.ROLLOUT }} -n ${{ env.ENV }}
+              sleep 5
+            done
+            echo "Rollout is Healthy!"
+          else
+            echo "No rollout found. Skipping restart."
+          fi

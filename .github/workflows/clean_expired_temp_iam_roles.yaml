@@ -1,0 +1,67 @@
+name: Clean Expired Temorary IAM Roles
+
+on:
+    workflow_dispatch:
+    schedule:
+        - cron: '00 1 * * *'  # 5:00AM DXB time, Daily
+
+jobs:
+    cleanup-roles:
+        runs-on: [dbz-runner-amd-v2-small]
+        strategy:
+            fail-fast: false
+            matrix:
+                environment: [ops] #prod
+
+        steps:
+          - name: Clean Container 📦🧹
+            uses: dbz/actions-clean@v2
+    
+          - name: Checkout repository 👀
+            uses: actions/checkout@v4
+            with:
+              clean: true
+
+          - name: Intialize Env
+            run: |
+              if [[ "${{matrix.environment}}" == "prod" ]]; then
+                ROLE_TO_ASSUME=arn:aws:iam::847754352879:role/CrossAccount_EKS_for_MENAOps
+              elif [[ "${{matrix.environment}}" == "ops" ]]; then
+                ROLE_TO_ASSUME=arn:aws:iam::604664627747:role/ops-runner-account-management-role
+              fi
+
+              echo "ROLE_TO_ASSUME: ${ROLE_TO_ASSUME}"
+              echo "ROLE_TO_ASSUME=$ROLE_TO_ASSUME" >> $GITHUB_ENV
+
+          - name: Configure AWS Credentials
+            uses: aws-actions/configure-aws-credentials@v4
+            with:
+              role-skip-session-tagging: true
+              aws-region: eu-west-1
+              role-to-assume: "${{env.ROLE_TO_ASSUME}}"
+              role-duration-seconds: 1800
+
+          - name: Clean obsolete roles
+            shell: bash
+            run: | 
+              timestamp_now=`expr $(date -u +%s)`
+              echo "Current time utc: ${timestamp_now}"
+      
+              aws iam list-roles --output json --query 'Roles[?contains(RoleName, `TEMPORARY_INFRA_ROLE_`)].RoleName' | jq -r '.[]' | while read role_name; do
+                echo "Check role: ${role_name}"
+                timestamp=$(aws iam list-role-tags --output text --role-name ${role_name} --query 'Tags[?Key==`exp-timestamp`].Value')
+                echo "Role timestamp: ${timestamp}"
+      
+                if [ ${timestamp} -lt ${timestamp_now} ]; then
+                  echo "Remove outdated role ${role_name}"
+
+                  aws iam list-attached-role-policies --role-name ${role_name} --query 'AttachedPolicies[*].PolicyArn' --output json | jq -r '.[]' | while read policy_arn; do
+                    echo "Detach policy: ${policy_arn}"
+                    aws iam detach-role-policy --role-name ${role_name} --policy-arn ${policy_arn}
+                  done
+
+                  aws iam delete-role --role-name ${role_name}
+                  echo "Role removed: ${role_name}"
+                fi
+              done
+      

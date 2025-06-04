@@ -1,0 +1,138 @@
+name: Data-Copy | Lower-Env | DROP-DB
+
+on:
+  workflow_dispatch:
+    inputs:
+      Environment:
+        description: 'Select an environment to drop db'
+        required: true
+        type: choice
+        options: ['beta-cc', 'beta-me', 'beta-nl', 'beta-pro', 'beta-pw', 'beta-bid', 'beta-red']
+
+  workflow_call:
+    inputs:
+      Environment:
+        description: 'Select an environment to drop db'
+        required: true
+        type: string
+
+env:
+    MYSQL_CLIENT_POD_NAME_PREFIX: "data-copy-mysql-client"
+    POSTGRESQL_CLIENT_POD_NAME_PREFIX: "data-copy-postgresql-client"
+    POD_WAIT_TIME_IN_SECONDS: 10
+
+jobs:
+
+  drop-db-job:
+    runs-on: [self-hosted, dbz-runner-amd-v2-small]
+    steps:
+
+    - name: Clean Container
+      uses: dbz/actions-clean@v2
+
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        clean: true
+
+    - name: Intialize Env
+      run: |
+        if [[ ${{inputs.Environment}} == beta-* ]]; then
+          echo "K8S_CONTEXT=arn:aws:eks:eu-west-1:857520607940:cluster/beta-eks-cluster" >> $GITHUB_ENV
+          echo "ROLE_TO_ASSUME=arn:aws:iam::857520607940:role/CrossAccount_EKS_for_MENAOps" >> $GITHUB_ENV
+        else
+            echo "Wrong/Invalid Environment"
+            exit 1
+        fi
+
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-skip-session-tagging: true
+        aws-region: eu-west-1
+        role-to-assume: "${{env.ROLE_TO_ASSUME}}"
+        role-duration-seconds: 3600
+
+    - name: Install Kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'v1.28.0'
+
+    - name: Configure Kubectl
+      uses: azure/k8s-set-context@v3
+      with:
+        method: kubeconfig
+        kubeconfig: ${{ secrets.KUBE_CONFIG }}
+        context: ${{ env.K8S_CONTEXT }}
+
+    - name: Drop DB
+      run: |
+
+        get_services_array() {
+            local services=()
+            local skip_headers=1
+            while IFS=, read -r TARGETED_SERVICES || [ -n "$TARGETED_SERVICES" ]
+            do
+                if ((skip_headers))
+                then
+                    ((skip_headers--))
+                else
+                    services+=("$TARGETED_SERVICES")
+                fi
+            done < ./data_copy_inputfiles/dbs/targeted_services.csv
+            echo "${services[@]}"
+            }
+
+        IFS=' '
+        services_array=$(get_services_array)
+        
+        read -r -a services <<< "$services_array"
+        
+        # Check current context!
+        kubectl config get-contexts | grep "*"
+
+        for service in "${services[@]}"; do
+            echo "Service Name is $service"
+            
+            # Get data-copy env specific secrets
+            rds_secret_result=$(aws secretsmanager get-secret-value --secret-id data-copy-secrets/${{inputs.Environment}}/${service} | jq -r '.SecretString| fromjson')
+            rds_host=$(echo $rds_secret_result | jq -r '.DATABASE_HOST')
+            rds_username=$(echo $rds_secret_result | jq -r '.DATABASE_USER')
+            rds_password=$(echo $rds_secret_result | jq -r '.DATABASE_PASSWORD')
+            rds_db=$(echo $rds_secret_result | jq -r '.DATABASE_NAME')
+            rds_engine=$(echo $rds_secret_result | jq -r '.DATABASE_ENGINE')
+
+            MYSQL_CLIENT_POD_NAME=${MYSQL_CLIENT_POD_NAME_PREFIX}-${{inputs.Environment}}
+            POSTGRESQL_CLIENT_POD_NAME=${POSTGRESQL_CLIENT_POD_NAME_PREFIX}-${{inputs.Environment}}
+
+            if [[ "$rds_engine" = "mysql" ]]; then
+
+                # Create MySQL Client Pod
+                pod_exist=$(kubectl get pods -n infra | grep $MYSQL_CLIENT_POD_NAME | { grep -v grep || true; } )
+                if [[ -z "$pod_exist" ]]; then
+                    kubectl run -n infra $MYSQL_CLIENT_POD_NAME --image=mysql --restart=Never --env=MYSQL_ALLOW_EMPTY_PASSWORD=true
+                    sleep $POD_WAIT_TIME_IN_SECONDS
+                fi
+
+                # Drop the DB
+                echo "Dropping DB '${service}'..."
+                echo "kubectl exec -n infra -it $MYSQL_CLIENT_POD_NAME -- mysql --host=$rds_host --user=$rds_username --password=xxxxxxxxxxx --verbose --execute=\"DROP DATABASE IF EXISTS ${rds_db};\" "
+                kubectl exec -n infra -it $MYSQL_CLIENT_POD_NAME -- mysql --host=$rds_host --user=$rds_username --password=$rds_password --verbose --execute="DROP DATABASE IF EXISTS ${rds_db};"
+
+            elif [[ "$rds_engine" = "postgresql" ]]; then
+                
+                # Create PostgreSQL Client Pod
+                pod_exist=$(kubectl get pods -n infra | grep $POSTGRESQL_CLIENT_POD_NAME | { grep -v grep || true; } )
+                if [[ -z "$pod_exist" ]]; then
+                    kubectl run -n infra $POSTGRESQL_CLIENT_POD_NAME --image=postgres --restart=Never --env=POSTGRES_PASSWORD=mysecretpassword
+                    sleep $POD_WAIT_TIME_IN_SECONDS
+                fi
+
+                # Drop the DB
+                echo "Dropping DB '${service}'..."
+                echo "kubectl exec -n infra -it $POSTGRESQL_CLIENT_POD_NAME -- psql -h $rds_host -U $rds_username -W -d postgres -a -v VERBOSITY=verbose -c \"DROP DATABASE IF EXISTS ${rds_db};\" <<< \"xxxxxxxxxxx\" "
+                kubectl exec -n infra -it $POSTGRESQL_CLIENT_POD_NAME -- psql -h $rds_host -U $rds_username -W -d postgres -a -v VERBOSITY=verbose -c "DROP DATABASE IF EXISTS ${rds_db};" <<< "$rds_password"
+
+            fi
+
+        done

@@ -1,0 +1,96 @@
+name: Revert Service Deployment
+
+on:
+    workflow_call:
+      inputs:
+        application:
+          required: true
+          type: string
+        environment:
+          required: true
+          type: string
+
+jobs:
+
+    revert-service-deployment:
+        runs-on: [dbz-infra-runner-amd-v2]
+        steps:
+        - name: Clean Container 📦🧹
+          uses: dbz/actions-clean@v2
+
+        - name: Clean SSH key 🧹🔑
+          uses: JesseTG/rm@v1.0.2
+          with:
+            path: /home/ec2-user/.ssh/id_rsa
+
+        - name: Install SSH key 🔐
+          uses: shimataro/ssh-key-action@v2
+          with:
+            key: ${{ secrets.SSH_KEY }}
+            name: id_rsa
+            known_hosts: ${{ secrets.KNOWN_HOSTS }}
+            
+        - name: Bot Activity Slack Notification
+          uses: slackapi/slack-github-action@v1.25.0
+          with:
+            channel-id: C07QH1FU5SQ
+            slack-message: "${{ github.actor }} is going to revert deployment for application ${{ inputs.application }} on environment ${{ inputs.environment }}"
+          env:
+            SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+            
+        - name: Clone Infra-Automation 👷🏼‍♂️
+          run: |
+            git clone -b main git@github.com:dbz/infra-automation.git
+        
+        - name: Clone helmfiles-apps 👷🏼‍♂️
+          run: |
+            git clone -b master git@github.com:dbz/helmfiles-apps.git
+        
+        - name: configure path
+          run: |
+            path=""
+            if [[ "${{ inputs.application }}" == "fenginx" ]]; then
+              values_file_path="helm-ops/frontend-nginx/values-${{ inputs.environment }}.yaml"
+            elif [[ "${{ inputs.application }}" == "openresty" ]]; then
+              values_file_path="helm-ops/openresty/values-${{ inputs.environment }}.yaml"
+            elif [[ "${{ inputs.application }}" == "openresty-property" ]]; then
+              values_file_path="helm-ops/openresty/values-property-${{ inputs.environment }}.yaml"
+            else
+              values_file_path="apps/${{ inputs.application }}/common/${{ inputs.environment }}.yaml"
+            fi
+
+            echo "VALUES_FILE_PATH=$values_file_path" >> $GITHUB_ENV
+
+        - name: Log last 2 commits on the targeted service and env
+          run: |
+            cd helmfiles-apps
+            git log -- ${{ env.VALUES_FILE_PATH }} | grep 'commit' -A 5 | head -n 12
+
+        - name: Check ability to revert
+          run: |
+            cd helmfiles-apps
+            # Check previous commit if have tag in the commit message
+            previous_commit_msg=$(git log -- ${{ env.VALUES_FILE_PATH }} | grep 'commit' -A 5 | head -n 12 | tail -n 3)
+            is_previous_commit_contain_tag=$(echo $previous_commit_msg | grep 'tag:' | { grep -v grep || true; } )
+            if [[ -z "$is_previous_commit_contain_tag" ]]; then
+                echo "Previous Commit doesn't contain a tag, Cannot Revert ... Kindly reach your TL or someone from Infra team to do the reverting"
+                exit 1
+            else
+                echo "Service can be reverted to previous image-tag"
+                exit 0
+            fi
+        
+        - name: Revert the service
+          run: |
+            cd helmfiles-apps
+            git config user.name "EKSDeployBot"
+            git config user.email "tech.devops@dbz.com"
+            previous_commit=$(git log -- ${{ env.VALUES_FILE_PATH }} | grep 'commit' | sed 1,1d | head -n 1 | awk -F' ' '{print $2}')
+            echo $previous_commit
+            git checkout $previous_commit -- ${{ env.VALUES_FILE_PATH }}
+            git commit -m "Revert ${{ inputs.application }} on ${{ inputs.environment }} to previous image-tag [skip ci]"
+            git diff | cat
+            git push
+
+        
+    

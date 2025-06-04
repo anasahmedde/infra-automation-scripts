@@ -1,0 +1,444 @@
+{
+    "prd-car-service-blog": {
+        "db_identifier": "prd-dbz-car-service-blog",
+        "old_postfix": "v8035",
+        "new_postfix": "v8036",
+        "current_db_version": "8.0.35",
+        "new_db_version": "8.0.36",
+        "master_instance_size": "db.t4g.small",
+        "replica_instance_size": "",
+        "route53_master_record": "prd-car-service-blog-rds.dbzcloud.internal",
+        "route53_replica_record": "",
+        "rds_secret_name": "prd-car-service-blog-rds",
+        "related_services": [
+            "car-sevice-blog"
+        ]
+    },
+    "prd-cars-blog": {
+        "db_identifier": "prd-dbz-cars-blog",
+        "old_postfix": "v8035",
+        "new_postfix": "v8036",
+        "current_db_version": "8.0.35",
+        "new_db_version": "8.0.36",
+        "master_instance_size": "db.t4g.large",
+        "replica_instance_size": "",
+        "route53_master_record": "prd-cars-blog-rds.dbzcloud.internal",
+        "route53_replica_record": "",
+        "rds_secret_name": "prd-cars-blog-rds",
+        "related_services": [
+            "cars-blog"
+        ]
+    },
+    "prd-property-blog": {
+        "db_identifier": "prd-dbz-property-blog",
+        "old_postfix": "v8035",
+        "new_postfix": "v8036",
+        "current_db_version": "8.0.35",
+        "new_db_version": "8.0.36",
+        "master_instance_size": "db.t4g.medium",
+        "replica_instance_size": "",
+        "route53_master_record": "prd-dbz-property-blog-rds.dbzcloud.internal",
+        "route53_replica_record": "",
+        "rds_secret_name": "prd-dbz-property-blog",
+        "related_services": [
+            "property-blog"
+        ]
+    },
+    "prd-recruiter-blog": {
+        "db_identifier": "prd-dbz-recruiter-paa-blog",
+        "old_postfix": "v8035",
+        "new_postfix": "v8036",
+        "current_db_version": "8.0.35",
+        "new_db_version": "8.0.36",
+        "master_instance_size": "db.t4g.small",
+        "replica_instance_size": "",
+        "route53_master_record": "prd-dbz-recruiter-paa-blog-rds.dbzcloud.internal",
+        "route53_replica_record": "",
+        "rds_secret_name": "prd-dbz-recruiter-paa-blog",
+        "related_services": [
+            "recruiter-paa-blog"
+        ]
+    },
+    "prd-vas-dbz-cars-blog": {
+        "db_identifier": "prd-vas-dbz-cars-blog",
+        "old_postfix": "v8036",
+        "new_postfix": "v8036-arm",
+        "current_db_version": "8.0.36",
+        "new_db_version": "8.0.36",
+        "master_instance_size": "db.t4g.small",
+        "replica_instance_size": "",
+        "route53_master_record": "prd-vas-dbz-cars-blog-rds.dbzcloud.internal",
+        "route53_replica_record": "",
+        "rds_secret_name": "prd-vas-dbz-cars-blog",
+        "related_services": [
+            "vas-dbz-cars-blog"
+        ]
+    },
+    "prd-report-listing": {
+        "db_identifier": "prd-report-listing",
+        "old_postfix": "v8035",
+        "new_postfix": "v8036",
+        "current_db_version": "8.0.35",
+        "new_db_version": "8.0.36",
+        "master_instance_size": "db.t4g.large",
+        "replica_instance_size": "db.t4g.large",
+        "route53_master_record": "prd-report-listing-service-rds.dbzcloud.internal",
+        "route53_replica_record": "prd-report-listing-service-rds-replica.dbzcloud.internal",
+        "rds_secret_name": "prd-report-listing",
+        "related_services": [
+            "user-service"
+        ]
+    },
+    "prd-property-lpv": {
+        "db_identifier": "prd-property-lpv",
+        "old_postfix": "v8035",
+        "new_postfix": "v8036",
+        "current_db_version": "8.0.35",
+        "new_db_version": "8.0.36",
+        "master_instance_size": "db.m6g.xlarge",
+        "replica_instance_size": "db.t4g.medium",
+        "route53_master_record": "prd-property-lpv-rds.dbzcloud.internal",
+        "route53_replica_record": "prd-property-lpv-rds-replica.dbzcloud.internal",
+        "rds_secret_name": "prd-property-lpv",
+        "related_services": [
+            "property-lpv"
+        ]
+    },
+    "prd-dbz-bi": {
+        "db_identifier": "prd-dbz-bi-rds",
+        "old_postfix": "v8035",
+        "new_postfix": "v8036",
+        "current_db_version": "8.0.35",
+        "new_db_version": "8.0.36",
+        "master_instance_size": "db.t4g.small",
+        "replica_instance_size": "",
+        "route53_master_record": "prd-dbz-bi-rds.dbzcloud.internal",
+        "route53_replica_record": "",
+        "rds_secret_name": "prd-dbz-bi-rds",
+        "related_services": []
+    },
+    "prd-horizontal-buyer": {
+        "db_identifier": "prd-horizontal-buyer",
+        "old_postfix": "v8035",
+        "new_postfix": "v8036",
+        "current_db_version": "8.0.35",
+        "new_db_version": "8.0.36",
+        "master_instance_size": "db.m6g.large",
+        "replica_instance_size": "db.t4g.large",
+        "route53_master_record": "prd-horizontal-buyer-rds.dbzcloud.internal",
+        "route53_replica_record": "prd-horizontal-buyer-replica-1.dbzcloud.internal",
+        "rds_secret_name": "prd-horizontal-buyer",
+        "related_services": [
+            "horizontal-buyer"
+        ]
+    },
+    "prd-notification-scheduler": {
+        "db_identifier": "prd-notification-scheduler",
+        "old_postfix": "v8035",
+        "new_postfix": "v8036",
+        "current_db_version": "8.0.35",
+        "new_db_version": "8.0.36",
+        "master_instance_size": "db.t4g.large",
+        "replica_instance_size": "",
+        "route53_master_record": "prd-notification-scheduler-rds.dbzcloud.internal",
+        "route53_replica_record": "",
+        "rds_secret_name": "prd-notification-scheduler",
+        "related_services": [
+            "notification-scheduler"
+        ]
+    },
+    "prd-savedsearch": {
+        "db_identifier": "prd-savedsearch",
+        "old_postfix": "v8035",
+        "new_postfix": "v8036",
+        "current_db_version": "8.0.35",
+        "new_db_version": "8.0.36",
+        "master_instance_size": "db.r6g.large",
+        "replica_instance_size": "",
+        "route53_master_record": "prd-savedsearch-rds.dbzcloud.internal",
+        "route53_replica_record": "",
+        "rds_secret_name": "prd-savedsearch",
+        "related_services": [
+            "savedsearch"
+        ]
+    },
+    "prd-pegasus": {
+        "db_identifier": "prd-pegasus",
+        "old_postfix": "v8035",
+        "new_postfix": "v8036",
+        "current_db_version": "8.0.35",
+        "new_db_version": "8.0.36",
+        "master_instance_size": "db.t4g.small",
+        "replica_instance_size": "",
+        "route53_master_record": "prd-pegasus-rds.dbzcloud.internal",
+        "route53_replica_record": "",
+        "rds_secret_name": "prd-pegasus",
+        "related_services": [
+            "pegasus"
+        ]
+    },
+    "prd-authenticator": {
+        "db_identifier": "prd-authenticator",
+        "old_postfix": "v8035",
+        "new_postfix": "v8036",
+        "current_db_version": "8.0.35",
+        "new_db_version": "8.0.36",
+        "master_instance_size": "db.t4g.large",
+        "replica_instance_size": "db.t4g.medium",
+        "route53_master_record": "prd-authenticator-rds.dbzcloud.internal",
+        "route53_replica_record": "prd-authenticator-rds-replica.dbzcloud.internal",
+        "rds_secret_name": "prd-authenticator",
+        "related_services": [
+            "authenticator"
+        ]
+    },
+    "prd-basic": {
+        "db_identifier": "prd-basic-1",
+        "old_postfix": "v8035",
+        "new_postfix": "v8036",
+        "current_db_version": "8.0.35",
+        "new_db_version": "8.0.36",
+        "master_instance_size": "db.t4g.medium",
+        "replica_instance_size": "",
+        "route53_master_record": "prd-basic-1-rds.dbzcloud.internal",
+        "route53_replica_record": "",
+        "rds_secret_name": "prd-basic-1",
+        "related_services": [
+            "sitemap",
+            "tx-service"
+        ]
+    },
+    "prd-content-first": {
+        "db_identifier": "prd-content-first",
+        "old_postfix": "v8035",
+        "new_postfix": "v8036",
+        "current_db_version": "8.0.35",
+        "new_db_version": "8.0.36",
+        "master_instance_size": "db.m6g.2xlarge",
+        "replica_instance_size": "db.t4g.xlarge",
+        "route53_master_record": "prd-content-first-rds.dbzcloud.internal",
+        "route53_replica_record": "prd-content-first-rds-replica.dbzcloud.internal",
+        "rds_secret_name": "prd-content-first",
+        "related_services": [
+            "content-first"
+        ]
+    },
+    "prd-chat-service": {
+        "db_identifier": "prd-chat-service",
+        "old_postfix": "v8035",
+        "new_postfix": "v8036",
+        "current_db_version": "8.0.35",
+        "new_db_version": "8.0.36",
+        "master_instance_size": "db.t4g.large",
+        "replica_instance_size": "db.t4g.medium",
+        "route53_master_record": "prd-chat-service-rds.dbzcloud.internal",
+        "route53_replica_record": "prd-chat-service-rds-replica.dbzcloud.internal",
+        "rds_secret_name": "prd-chat-service",
+        "related_services": [
+            "chat-service"
+        ]
+    },
+    "prd-business-critical": {
+        "db_identifier": "prd-business-critical-1",
+        "old_postfix": "v8035",
+        "new_postfix": "v8036",
+        "current_db_version": "8.0.35",
+        "new_db_version": "8.0.36",
+        "master_instance_size": "db.m6g.large",
+        "replica_instance_size": "db.t4g.small",
+        "route53_master_record": "prd-business-critical-1-rds.dbzcloud.internal",
+        "route53_replica_record": "prd-business-critical-1-rds-replica.dbzcloud.internal",
+        "rds_secret_name": "prd-business-critical-1",
+        "related_services": [
+            "calltracking",
+            "favorites"
+        ]
+    },
+    "prd-bigluu": {
+        "db_identifier": "prd-bigluu",
+        "old_postfix": "v8035",
+        "new_postfix": "v8036",
+        "current_db_version": "8.0.35",
+        "new_db_version": "8.0.36",
+        "master_instance_size": "db.t4g.large",
+        "replica_instance_size": "db.t4g.small",
+        "route53_master_record": "prd-bigluu-rds.dbzcloud.internal",
+        "route53_replica_record": "prd-bigluu-rds-replica.dbzcloud.internal",
+        "rds_secret_name": "prd-bigluu",
+        "related_services": [
+            "bigluu"
+        ]
+    },
+    "prd-mission-critical-package-related": {
+        "db_identifier": "prd-mission-critical-package-related",
+        "old_postfix": "v8036",
+        "new_postfix": "v8036-new",
+        "current_db_version": "8.0.36",
+        "new_db_version": "8.0.36",
+        "master_instance_size": "db.m6g.xlarge",
+        "replica_instance_size": "db.t4g.small",
+        "route53_master_record": "prd-mission-critical-package-related-rds.dbzcloud.internal",
+        "route53_replica_record": "prd-mission-critical-package-related-rds-replica.dbzcloud.internal",
+        "rds_secret_name": "prd-mission-critical-package-related",
+        "related_services": [
+            "greedy",
+            "dbzuae-web"
+        ]
+    },
+    "prd-dbz": {
+        "db_identifier": "prd-dbz",
+        "old_postfix": "v5744-new",
+        "new_postfix": "v5744-2xl",
+        "current_db_version": "5.7.44",
+        "new_db_version": "5.7.44",
+        "master_instance_size": "db.r5.2xlarge",
+        "replica_instance_size": "db.r5.xlarge",
+        "route53_master_record": "prd-dbz-rds.dbzcloud.internal",
+        "route53_replica_record": "prd-dbz-rds-replica.dbzcloud.internal",
+        "rds_secret_name": "prd-dbz",
+        "related_services": [
+            "dbzuae-web"
+        ]
+    },
+    "prd-dripper": {
+        "db_identifier": "prd-dripper",
+        "old_postfix": "v5744",
+        "new_postfix": "v5744-new",
+        "current_db_version": "5.7.44",
+        "new_db_version": "5.7.44",
+        "master_instance_size": "db.m5.large",
+        "replica_instance_size": "",
+        "route53_master_record": "prd-dripper-rds.dbzcloud.internal",
+        "route53_replica_record": "",
+        "rds_secret_name": "prd-dripper",
+        "related_services": [
+            "dbzuae-web"
+        ]
+    },
+    "prd-location-service": {
+        "db_identifier": "prd-location-service",
+        "old_postfix": "v1213",
+        "new_postfix": "v1218",
+        "current_db_version": "12.13",
+        "new_db_version": "12.18",
+        "master_instance_size": "db.t4g.medium",
+        "replica_instance_size": "",
+        "route53_master_record": "prd-location-service-rds.dbzcloud.internal",
+        "route53_replica_record": "",
+        "rds_secret_name": "",
+        "related_services": [
+            "location-service"
+        ]
+    },
+    "prd-seller-service": {
+        "db_identifier": "prd-seller-service",
+        "old_postfix": "v1404",
+        "new_postfix": "v1411",
+        "current_db_version": "14.4",
+        "new_db_version": "14.11",
+        "master_instance_size": "db.t4g.medium",
+        "replica_instance_size": "",
+        "route53_master_record": "seller-service-rds.dbzcloud.internal",
+        "route53_replica_record": "",
+        "rds_secret_name": "",
+        "related_services": [
+            "seller-service",
+            "dbzuae-web"
+        ]
+    },
+    "prd-social-service": {
+        "db_identifier": "prd-social-service",
+        "old_postfix": "v1404",
+        "new_postfix": "v1411",
+        "current_db_version": "14.4",
+        "new_db_version": "14.11",
+        "master_instance_size": "db.t4g.xlarge",
+        "replica_instance_size": "",
+        "route53_master_record": "social-service-rds.dbzcloud.internal",
+        "route53_replica_record": "",
+        "rds_secret_name": "",
+        "related_services": [
+            "seller-service"
+        ]
+    },
+    "prd-ats": {
+        "db_identifier": "prd-ats",
+        "old_postfix": "v1404",
+        "new_postfix": "v1411",
+        "current_db_version": "14.4",
+        "new_db_version": "14.11",
+        "master_instance_size": "db.t4g.xlarge",
+        "replica_instance_size": "db.t4g.small",
+        "route53_master_record": "ats-rds.dbzcloud.internal",
+        "route53_replica_record": "ats-rds-replica.dbzcloud.internal",
+        "rds_secret_name": "",
+        "related_services": [
+            "ats"
+        ]
+    },
+    "dev-space-postgresbatch": {
+        "db_identifier": "dev-space-dbz-postgresbatch",
+        "old_postfix": "",
+        "new_postfix": "temp",
+        "current_db_version": "12.13",
+        "new_db_version": "12.18",
+        "master_instance_size": "db.t4g.micro",
+        "replica_instance_size": "",
+        "route53_master_record": "",
+        "route53_replica_record": "",
+        "rds_secret_name": "",
+        "related_services": [
+            "seller-service",
+            "social-service",
+            "location-service"
+        ]
+    },
+    "dev-space-dbz-batch1": {
+        "db_identifier": "dev-space-dbz-batch1",
+        "old_postfix": "",
+        "new_postfix": "new",
+        "current_db_version": "8.0.35",
+        "new_db_version": "8.0.36",
+        "master_instance_size": "db.t4g.medium",
+        "replica_instance_size": "",
+        "multi_az": "false",
+        "route53_master_record": "",
+        "route53_replica_record": "",
+        "rds_secret_name": "dev-space-dbz-batch1",
+        "related_services": [
+            "calltracking",
+            "chatservice",
+            "contentfirst",
+            "bigluu",
+            "favorites",
+            "greedy",
+            "pegasus",
+            "user-service",
+            "notification-scheduler"
+        ]
+    },
+    "dev-space-dbz-batch2": {
+        "db_identifier": "dev-space-dbz-batch2",
+        "old_postfix": "",
+        "new_postfix": "new",
+        "current_db_version": "8.0.35",
+        "new_db_version": "8.0.36",
+        "master_instance_size": "db.t4g.medium",
+        "replica_instance_size": "",
+        "multi_az": "false",
+        "route53_master_record": "",
+        "route53_replica_record": "",
+        "rds_secret_name": "dev-space-dbz-batch2",
+        "related_services": [
+            "authenticator",
+            "horizontal-buyer",
+            "property-lpv",
+            "recurring-payments",
+            "user-service",
+            "savedsearch",
+            "subscribify",
+            "tx-service"
+        ]
+    }
+    
+}

@@ -1,0 +1,301 @@
+name: Create Temporary Access Role
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+
+      base_role:
+        required: true
+        type: string
+
+      user_email:
+        required: true
+        type: string
+
+      validity_hours:
+        required: true
+        type: string
+
+      policies_to_attach:
+        required: true
+        type: string
+
+      justification:
+        description: 'Justification (reason for granting these policies)'
+        required: true
+        type: string
+
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Select an account where to create a role'
+        required: true
+        default: "ops"
+        type: choice
+        options: ["ops", "prod"]
+
+      base_role:
+        description: 'Select your assigned iam role in testing account (857520607940)'
+        required: true
+        type: choice
+        options: ["AdministratorAccessBase-Role_a277c23672c7e354", "DeveloperJunior-Role_8669f5906e43fac9"]
+
+      user_email:
+        description: 'User email who can assume the role'
+        required: true
+        type: string
+
+      validity_hours:
+        description: 'The number of hours the role is valid. (Should be less or equal 24h)'
+        default: "8"
+        required: true
+        type: string
+
+      kube_role:
+        description: 'Create kube access role attached to RBAC (no AWS policies allowed)'
+        required: true
+        default: false
+        type: boolean
+
+      policies_to_attach:
+        required: false
+        default: ""
+        type: string
+        description: >
+          Comma separated list of policies.
+          Options available: dev-debugging-policy,AmazonS3ReadOnlyAccess,AmazonS3FullAccess,AmazonRDSReadOnlyAccess,AmazonRDSFullAccess,
+          IAMReadOnlyAccess,SecretsManagerReadWrite,AmazonSSMFullAccess,AmazonEC2FullAccess,AmazonEC2ReadOnlyAccess,KMSFullaccess
+          AmazonRoute53ReadOnlyAccess,AmazonRoute53FullAccess,AmazonEC2ContainerRegistryFullAccess,AmazonEC2ContainerRegistryReadOnly,AmazonSSMFullAccess,
+          CloudWatchReadOnlyAccess,AmazonOpenSearchServiceFullAccess,AmazonDynamoDBFullAccess,AmazonElastiCacheFullAccess,CloudFrontFullAccess,AmazonEKSClusterPolicy,
+          EKSaccess
+
+      justification:
+        description: 'Justification (reason for granting these policies)'
+        required: true
+        type: string
+
+jobs:
+  create-temp-role:
+    runs-on: [dbz-infra-runner-amd-v2]
+    steps:
+      - name: Clean Container 📦🧹
+        uses: dbz/actions-clean@v2
+
+      - name: Checkout repository 👀
+        uses: actions/checkout@v4
+        with:
+          clean: true
+
+      - name: Clean SSH key 🧹🔑
+        uses: JesseTG/rm@v1.0.2
+        with:
+          path: /home/ec2-user/.ssh/id_rsa
+
+      - name: Install SSH key 🔐
+        uses: shimataro/ssh-key-action@v2.6.1
+        with:
+          key: ${{ secrets.SSH_KEY }}
+          name: id_rsa
+          known_hosts: ${{ secrets.KNOWN_HOSTS }}
+
+      - name: Clone Infra-Automation 👷🏼‍♂️
+        run: |
+          git clone -b main git@github.com:dbz/infra-automation.git
+
+      - name: Initialize Logging Variables 🤖
+        run: |
+          event_payload=$(cat $GITHUB_EVENT_PATH)
+          inputs_string=$(echo "$event_payload" | jq -r '.inputs | to_entries | map("\(.key)=\(.value|tostring)") | join(",")')
+          echo "INPUT_PARAMETERS=$inputs_string" >> $GITHUB_ENV
+          echo "USER=${{ github.actor }}" >> $GITHUB_ENV
+          echo "ENVIRONMENT=${{ inputs.environment }}" >> $GITHUB_ENV
+          echo "WORKFLOW_EXECUTED=${{ github.workflow }}" >> $GITHUB_ENV
+          echo "LINK_TO_EXECUTION=https://github.com/${{ github.repository }}/actions/runs/${GITHUB_RUN_ID}" >> $GITHUB_ENV
+
+      - name: Send request to OpenSearch 📤
+        run: |
+          bash infra-automation/elk_logging/send_logs_to_elk.sh
+
+      - name: Intialize Env
+        run: |
+          USER_EMAIL=${{ inputs.user_email }}
+          echo "USER_EMAIL=${USER_EMAIL}"
+
+          # Adding $(( )) around the input to convert it from string into integer
+          # Because of github limitation for passing integer through reusable workflows
+          VALIDITY_HOURS=$((${{ inputs.validity_hours }}))
+          echo "VALIDITY_HOURS=${VALIDITY_HOURS}"
+
+          if [ "$VALIDITY_HOURS" -lt "1" ] || [ "$VALIDITY_HOURS" -gt "24" ]; then
+            echo "Validity in hours should be a value between 1 and 24. Provided value = $VALIDITY_HOURS"
+            curl -X POST -H 'Content-type: application/json' --data "{\"text\":\"Hey, ${{ inputs.user_email }}, Validity in hours should be a value between 1 and 24. Provided value = $VALIDITY_HOURS 🛑\"}" ${{ secrets.AWS_IAM_AUDITOR_SLACK_WEBHOOK }}
+            Exit 1
+          fi
+
+          BASE_ROLE="arn:aws:sts::857520607940:assumed-role/AWSReservedSSO_${{ inputs.base_role }}"
+          echo "BASE_ROLE=${BASE_ROLE}"
+
+          VALIDITY_SECONDS=$(($VALIDITY_HOURS * 3600))
+          echo "VALIDITY_SECONDS=${VALIDITY_SECONDS}"
+
+          EXP_TIMESTAMP_SEC=`expr $(date -u +%s) + $VALIDITY_SECONDS`
+          echo "EXP_TIMESTAMP_SEC=${EXP_TIMESTAMP_SEC}"
+
+          EXP_TIMESTAMP=$(date -d @${EXP_TIMESTAMP_SEC} +%FT%TZ)
+          echo "EXP_TIMESTAMP=${EXP_TIMESTAMP}"
+
+          is_kube_role="false"
+          if [[ ${{ github.event_name == 'workflow_dispatch' }} == true ]]; then
+            is_kube_role="${{inputs.kube_role}}"
+          fi
+
+          echo "is_kube_role: ${is_kube_role}"
+
+          if [[ "${is_kube_role}" == "true" ]]; then
+            ROLE_TYPE_NAME="Kube Access Role"
+            NEW_ROLE_NAME="TEMPORARY_INFRA_ROLE_KUBE_ACCESS_${USER_EMAIL}"
+            ALLOWED_POLICIES=""
+          else
+            ROLE_TYPE_NAME="AWS Infra Role"
+            NEW_ROLE_NAME="TEMPORARY_INFRA_ROLE_${USER_EMAIL}"
+            ALLOWED_POLICIES="dev-debugging-policy,AmazonS3ReadOnlyAccess,AmazonS3FullAccess,AmazonRDSReadOnlyAccess,AmazonRDSFullAccess,\
+              IAMReadOnlyAccess,SecretsManagerReadWrite,AmazonSSMFullAccess,AmazonEC2ReadOnlyAccess,AmazonEC2FullAccess,\
+              AmazonRoute53ReadOnlyAccess,AmazonRoute53FullAccess,AmazonEC2ContainerRegistryFullAccess,\
+              AmazonEC2ContainerRegistryReadOnly,CloudWatchReadOnlyAccess,AmazonRDSPerformanceInsightsReadOnly,AmazonSSMFullAccess,AmazonOpenSearchServiceFullAccess,\
+              AmazonDynamoDBFullAccess,AmazonElastiCacheFullAccess,CloudFrontFullAccess,AmazonEKSClusterPolicy,KMSFullaccess,EKSaccess"
+          fi
+
+          echo "${ROLE_TYPE_NAME}: ${NEW_ROLE_NAME}"
+
+          if [[ "${{inputs.environment}}" == "prod" ]]; then
+            ROLE_TO_ASSUME=arn:aws:iam::847754352879:role/CrossAccount_EKS_for_MENAOps
+            ACCOUNT_ID="847754352879"
+          elif [[ "${{inputs.environment}}" == "ops" ]]; then
+            ROLE_TO_ASSUME=arn:aws:iam::604664627747:role/ops-runner-account-management-role
+            ACCOUNT_ID="604664627747"
+          fi
+
+          echo "Account: ${{inputs.environment}}"
+          echo "Runner - ROLE_TO_ASSUME: ${ROLE_TO_ASSUME}"
+          echo "Policies to attach: ${{inputs.policies_to_attach}}"
+          echo "ALLOWED_POLICIES: ${ALLOWED_POLICIES}"
+
+          echo "ROLE_TO_ASSUME=$ROLE_TO_ASSUME" >> $GITHUB_ENV
+          echo "ACCOUNT_ID=$ACCOUNT_ID" >> $GITHUB_ENV
+          echo "ALLOWED_POLICIES=$ALLOWED_POLICIES" >> $GITHUB_ENV
+          echo "EXP_TIMESTAMP=$EXP_TIMESTAMP" >> $GITHUB_ENV
+          echo "USER_EMAIL=$USER_EMAIL" >> $GITHUB_ENV
+          echo "ROLE_TYPE_NAME=$ROLE_TYPE_NAME" >> $GITHUB_ENV
+          echo "NEW_ROLE_NAME=$NEW_ROLE_NAME" >> $GITHUB_ENV
+          echo "BASE_ROLE=$BASE_ROLE" >> $GITHUB_ENV
+          echo "EXP_TIMESTAMP_SEC=$EXP_TIMESTAMP_SEC" >> $GITHUB_ENV
+
+      - name: Slack notification 🔍
+        uses: dbz/action-slack-notify@main
+        env:
+          SLACK_USERNAME: AWS IAM Access Auditor
+          SLACK_WEBHOOK: ${{ secrets.AWS_IAM_AUDITOR_SLACK_WEBHOOK }}
+          SLACK_CHANNEL: '#aws-iam-auditor'
+          SLACK_COLOR: '#FF0000'
+          SLACK_LINK_NAMES: true
+          SLACK_MESSAGE: "👨‍🎓 ${{ env.USER_EMAIL }} is going to grant themselves ${{ env.ROLE_TYPE_NAME }} \"${{ inputs.policies_to_attach }}\" on ${{ inputs.environment }} account with justification: ${{ inputs.justification }}"
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-skip-session-tagging: true
+          aws-region: eu-west-1
+          role-to-assume: "${{env.ROLE_TO_ASSUME}}"
+          role-duration-seconds: 1800
+
+      - name: Create trust relationship policy docuemnt 🤝
+        shell: bash
+        run: |
+
+          template_policy='{
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {
+                        "AWS": "${BASE_ROLE}/${USER_EMAIL}"
+                    },
+                    "Action": "sts:AssumeRole",
+                    "Condition": {
+                        "StringEqualsIfExists": {
+                            "sts:DurationSeconds": "3600"
+                        },
+                        "DateLessThan": {
+                            "aws:CurrentTime": "${EXP_TIMESTAMP}"
+                        }
+                    }
+                }
+            ]
+          }'
+
+          trusted_policy=$(echo ${template_policy} | envsubst)
+          echo "trusted_policy=$trusted_policy" >> $GITHUB_ENV
+          echo "trusted_policy: ${trusted_policy}"
+
+      - name: Create the tmp role ♻️
+        shell: bash
+        run: |
+
+          tags_json="[{\"Key\": \"temporary-infra-access-role\", \"Value\": \"true\"}, {\"Key\": \"exp-timestamp\", \"Value\": \"${EXP_TIMESTAMP_SEC}\"}]"
+
+          if aws iam get-role --role-name ${NEW_ROLE_NAME} > /dev/null 2>&1; then 
+            echo "Role ${NEW_ROLE_NAME} already exists and will be removed"; 
+            role_name=${NEW_ROLE_NAME}
+
+            curl -X POST -H 'Content-type: application/json' --data "{\"text\":\"Hey ${{ env.USER_EMAIL }}, your role ${NEW_ROLE_NAME} already exists, it will be deleted and re-created \"}" ${{ secrets.AWS_IAM_AUDITOR_SLACK_WEBHOOK }}
+
+            aws iam list-attached-role-policies --role-name ${role_name} --query 'AttachedPolicies[*].PolicyArn' --output json | jq -r '.[]' | while read policy_arn; do
+              echo "Detach policy: ${policy_arn}"
+              aws iam detach-role-policy --role-name ${role_name} --policy-arn ${policy_arn}
+            done
+
+            aws iam delete-role --role-name ${role_name}
+            echo "Role removed: ${role_name}"
+          fi
+
+          aws iam create-role --role-name ${NEW_ROLE_NAME} --assume-role-policy-document "${trusted_policy}" --tags "${tags_json}"
+
+      - name: Attach Policies 🪜
+        shell: bash
+        run: |
+          policy_arns=()
+
+          IFS=',' read -r -a policy_names <<< "${{inputs.policies_to_attach}}"
+
+          for policy_name in "${policy_names[@]}"; do
+            new_policy_name=$(echo $policy_name | xargs)
+
+            if [[ "${ALLOWED_POLICIES}" != *"${new_policy_name}"* ]]; then
+              echo "Policy ${new_policy_name} is not allowed to attach"
+              continue;
+            fi
+
+            policy_arn=$(aws iam list-policies --scope All --query "Policies[?PolicyName=='$new_policy_name'].Arn" --output text)
+            echo ${policy_arn}
+
+            echo "Attach policy: ${policy_arn} to ${NEW_ROLE_NAME}"
+            aws iam attach-role-policy --role-name ${NEW_ROLE_NAME} --policy-arn ${policy_arn}
+          done
+
+      - name: Name Of The New Role ✍️
+        shell: bash
+        run: |
+          echo " "
+          echo "======================================================================"
+          echo "These informations will be required while configuring console access"
+          echo "Account_ID: ${ACCOUNT_ID}"
+          echo "IAM_role_name: ${NEW_ROLE_NAME}"
+          echo "======================================================================"
+          echo " "
+          echo "======================================================================"
+          echo "The AWS ARN of the new role (Should be used while cli access [.aws/config]):"
+          aws iam get-role --role-name ${NEW_ROLE_NAME} --query 'Role.Arn' --output text
+          echo "======================================================================"

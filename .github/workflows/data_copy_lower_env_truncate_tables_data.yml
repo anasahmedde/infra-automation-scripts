@@ -1,0 +1,265 @@
+name: Data-Copy | Lower-Env | TRUNCATE-TABLES-DATA
+
+on:
+  workflow_dispatch:
+    inputs:
+      Environment:
+        description: 'Select an environment to do some action'
+        required: true
+        type: choice
+        options: ['beta-cc', 'beta-me', 'beta-nl', 'beta-pro', 'beta-pw', 'beta-bid', 'beta-red']
+      Truncate_With_Cascade:
+        description: 'Select if Truncate should be Cascaded or Not'
+        required: true
+        type: choice
+        options: ['false', 'true']
+
+env:
+    MYSQL_CLIENT_POD_NAME_PREFIX: "data-copy-mysql-client"
+    POSTGRESQL_CLIENT_POD_NAME_PREFIX: "data-copy-postgresql-client"
+    POD_WAIT_TIME_IN_SECONDS: 10
+
+jobs:
+
+  truncate-tables-data-job:
+    runs-on: [self-hosted, dbz-runner-amd-v2-small]
+    steps:
+
+    - name: Clean Container
+      uses: dbz/actions-clean@v2
+
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        clean: true
+
+    - name: Intialize Env
+      run: |
+        if [[ ${{inputs.Environment}} == beta-* ]]; then
+          echo "K8S_CONTEXT=arn:aws:eks:eu-west-1:857520607940:cluster/beta-eks-cluster" >> $GITHUB_ENV
+          echo "ROLE_TO_ASSUME=arn:aws:iam::857520607940:role/CrossAccount_EKS_for_MENAOps" >> $GITHUB_ENV
+        else
+            echo "Wrong/Invalid Environment"
+            exit 1
+        fi
+
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-skip-session-tagging: true
+        aws-region: eu-west-1
+        role-to-assume: "${{env.ROLE_TO_ASSUME}}"
+        role-duration-seconds: 7200 # 2 hours
+
+    - name: Install Kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'v1.28.0'
+
+    - name: Configure Kubectl
+      uses: azure/k8s-set-context@v3
+      with:
+        method: kubeconfig
+        kubeconfig: ${{ secrets.KUBE_CONFIG }}
+        context: ${{ env.K8S_CONTEXT }}
+
+    - name: Truncate Tables
+      run: |
+
+        get_services_array() {
+            local services=()
+            local skip_headers=1
+            while IFS=, read -r TARGETED_SERVICES || [ -n "$TARGETED_SERVICES" ]
+            do
+                if ((skip_headers))
+                then
+                    ((skip_headers--))
+                else
+                    services+=("$TARGETED_SERVICES")
+                fi
+            done < ./data_copy_inputfiles/dbs/targeted_services.csv
+            echo "${services[@]}"
+            }
+
+        get_tables_array() {
+            local service=$1
+            local tables=()
+            local skip_headers=1
+            while IFS=, read -r TARGETED_TABLES || [ -n "$TARGETED_TABLES" ]
+            do
+                if ((skip_headers))
+                then
+                    ((skip_headers--))
+                else
+                    tables+=("$TARGETED_TABLES")
+                fi
+            done < ./data_copy_inputfiles/tables/${service}_tables.csv
+            echo "${tables[@]}"
+            }
+
+        # Function to find foreign key reference tables recursively
+        # It maintains a call_stack array which maintain sequence of the call of function having table as parameter
+        find_foreign_key_references() {
+            local table="$1"
+            call_stack+=("$table")
+
+            echo "Processing table: $table"
+
+            # Build the SQL query
+            SQL_QUERY="SELECT cu.table_name
+            FROM information_schema.key_column_usage cu
+            INNER JOIN information_schema.referential_constraints rc ON rc.constraint_schema = cu.table_schema
+            AND rc.table_name = cu.table_name
+            AND rc.constraint_name = cu.constraint_name
+            WHERE cu.referenced_table_schema = '${rds_db}'
+            AND cu.referenced_table_name = '${table}';"
+
+            # Execute the query
+            # To remove the header from output we can use the -N or --skip-column-names flag. 
+            # Remove these two error from result using grep:
+            # --> ### Unable to use a TTY - input is not a terminal or the right kind of file  ###
+            # --> ### [Warning] Using a password on the command line interface can be insecure. ###
+
+            # echo "kubectl exec -n infra -it $MYSQL_CLIENT_POD_NAME -- mysql --host=$rds_host --user=$rds_username --password=********** --skip-column-names "${rds_db}" --execute="${SQL_QUERY}" 2>&1 | { grep -vE 'Warning|Unable to use a TTY' || true; }"
+            foreign_key_tables=$(kubectl exec -n infra -it $MYSQL_CLIENT_POD_NAME -- mysql --host=$rds_host --user=$rds_username --password=$rds_password --skip-column-names "${rds_db}" --execute="${SQL_QUERY}" 2>&1 | { grep -vE 'Warning|Unable to use a TTY' || true; })
+            # Get the exit code
+            exit_code=$?
+            echo "Returned Result --> $foreign_key_tables"
+            # Check if the exit code is not 0 or if foreign_key_tables contains "ERROR"
+            # Errors can be like
+            # --> ### ERROR 1045 (28000): Access denied for user 'root'@'localhost' (using password: YES) ###
+            # --> ### ERROR 1049 (42000): Unknown database 'null' ###
+            # --> ### error: You must be logged in to the server (Unauthorized) ###  ### <-- kubectl exec error becuase iam role session expired...
+            if [[ $exit_code -ne 0 || $foreign_key_tables =~ "ERROR" || $foreign_key_tables =~ "Unauthorized" ]]; then
+                echo "Returned Result failed with exit code $exit_code or contains ERROR"
+                exit 1
+            fi
+
+            # Check if query result is empty
+            if [ -z "${foreign_key_tables}" ]; then 
+                echo "No More Foreign Keys Table Found For Table: $table"
+                return
+            else
+                readarray -t foreign_key_tables_array <<< "${foreign_key_tables}"
+                echo "Array elements --> ${foreign_key_tables_array[@]}"
+                for fk_table in "${foreign_key_tables_array[@]}"; do
+                    if [ "$fk_table" != "$table" ]; then
+                        # Recursive call
+                        find_foreign_key_references "$fk_table" 
+                    else
+                        echo "Table $table has a reference to itself. Skipping recursive call."
+                    fi
+                done
+            fi
+            }
+
+        IFS=' '
+        services_array=$(get_services_array)
+        
+        read -r -a services <<< "$services_array"
+        
+        # Check current context!
+        kubectl config get-contexts | grep "*"
+
+        BEFORE_IMPORT_MYSQL_DB="SET FOREIGN_KEY_CHECKS=0;"
+        AFTER_IMPORT_MYSQL_DB="SET FOREIGN_KEY_CHECKS=1;"
+
+        BEFORE_IMPORT_POSTGRESQL_DB="SET session_replication_role = 'replica';"
+        AFTER_IMPORT_POSTGRESQL_DB="SET session_replication_role = 'origin';"
+
+        for service in "${services[@]}"; do
+            echo "Service Name is $service"
+            
+            # Get data-copy env specific secrets
+            rds_secret_result=$(aws secretsmanager get-secret-value --secret-id data-copy-secrets/${{inputs.Environment}}/${service} | jq -r '.SecretString| fromjson')
+            rds_host=$(echo $rds_secret_result | jq -r '.DATABASE_HOST')
+            rds_username=$(echo $rds_secret_result | jq -r '.DATABASE_USER')
+            rds_password=$(echo $rds_secret_result | jq -r '.DATABASE_PASSWORD')
+            rds_db=$(echo $rds_secret_result | jq -r '.DATABASE_NAME')
+            rds_engine=$(echo $rds_secret_result | jq -r '.DATABASE_ENGINE')
+
+            MYSQL_CLIENT_POD_NAME=${MYSQL_CLIENT_POD_NAME_PREFIX}-${{inputs.Environment}}
+            POSTGRESQL_CLIENT_POD_NAME=${POSTGRESQL_CLIENT_POD_NAME_PREFIX}-${{inputs.Environment}}
+
+
+            if [[ "$rds_engine" = "mysql" ]]; then
+
+                # Create MySQL Client Pod
+                pod_exist=$(kubectl get pods -n infra | grep $MYSQL_CLIENT_POD_NAME | { grep -v grep || true; } )
+                if [[ -z "$pod_exist" ]]; then
+                    kubectl run -n infra $MYSQL_CLIENT_POD_NAME --image=mysql --restart=Never --env=MYSQL_ALLOW_EMPTY_PASSWORD=true
+                    sleep $POD_WAIT_TIME_IN_SECONDS
+                fi
+
+                tables_array=$(get_tables_array "$service")
+                IFS=' '
+                
+                read -r -a tables <<< "$tables_array"
+
+                if [[ "${{inputs.Truncate_With_Cascade}}" == "true" ]]; then
+                    # Initialize empty call_stack array
+                    declare -a call_stack=()
+                    truncate_query="${BEFORE_IMPORT_MYSQL_DB} "
+                    truncate_query+="START TRANSACTION; "
+
+                    for table in "${tables[@]}"; do
+                        find_foreign_key_references "${table}"
+                    done
+
+                    # Print call stack in reverse order and make truncate table query in reverse order 
+                    echo "Calling call_stack for Service ${service}"
+                    for ((i=${#call_stack[@]}-1; i>=0; i--)); do
+                        echo "${call_stack[i]}"
+                        truncate_query+="TRUNCATE TABLE ${call_stack[i]}; " 
+                    done
+
+                    truncate_query+="COMMIT; "
+                    truncate_query+="${AFTER_IMPORT_MYSQL_DB} "
+
+                else
+                    
+                    truncate_query="${BEFORE_IMPORT_MYSQL_DB} "
+
+                    for table in "${tables[@]}"; do
+                        truncate_query+="TRUNCATE TABLE $table; "
+                    done
+
+                    truncate_query+="${AFTER_IMPORT_MYSQL_DB} "
+
+                fi
+
+                echo "kubectl exec -n infra -it $MYSQL_CLIENT_POD_NAME -- mysql --host=$rds_host --user=$rds_username --password=xxxxxxxxxxx ${rds_db} --verbose --execute=\"${truncate_query}\" "
+                kubectl exec -n infra -it $MYSQL_CLIENT_POD_NAME -- mysql --host=$rds_host --user=$rds_username --password=$rds_password ${rds_db} --verbose --execute="${truncate_query}"
+            
+            elif [[ "$rds_engine" = "postgresql" ]]; then
+                
+                # Create PostgreSQL Client Pod
+                pod_exist=$(kubectl get pods -n infra | grep $POSTGRESQL_CLIENT_POD_NAME | { grep -v grep || true; } )
+                if [[ -z "$pod_exist" ]]; then
+                    kubectl run -n infra $POSTGRESQL_CLIENT_POD_NAME --image=postgres --restart=Never --env=POSTGRES_PASSWORD=mysecretpassword
+                    sleep $POD_WAIT_TIME_IN_SECONDS
+                fi
+
+                tables_array=$(get_tables_array "$service")
+                IFS=' '
+                
+                read -r -a tables <<< "$tables_array"
+
+                if [[ "${{inputs.Truncate_With_Cascade}}" == "true" ]]; then
+                    truncate_query="${BEFORE_IMPORT_POSTGRESQL_DB} "
+                    for table in "${tables[@]}"; do
+                        truncate_query+="TRUNCATE TABLE ${table} RESTART IDENTITY CASCADE; "
+                    done
+                    truncate_query+="${AFTER_IMPORT_POSTGRESQL_DB} "
+                else
+                    truncate_query="${BEFORE_IMPORT_POSTGRESQL_DB} "
+                    for table in "${tables[@]}"; do
+                        truncate_query+="TRUNCATE TABLE ${table}; "
+                    done
+                    truncate_query+="${AFTER_IMPORT_POSTGRESQL_DB} "
+                fi
+                echo "kubectl exec -n infra -it $POSTGRESQL_CLIENT_POD_NAME -- psql -h $rds_host -U $rds_username -W -d ${rds_db} -a -v VERBOSITY=verbose -c \"${truncate_query}\" <<< \"xxxxxxxxxxx\" "
+                kubectl exec -n infra -it $POSTGRESQL_CLIENT_POD_NAME -- psql -h $rds_host -U $rds_username -W -d ${rds_db} -a -v VERBOSITY=verbose -c "${truncate_query}" <<< "$rds_password"
+            fi
+
+        done

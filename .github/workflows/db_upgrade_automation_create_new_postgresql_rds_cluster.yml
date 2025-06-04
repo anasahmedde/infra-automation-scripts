@@ -1,0 +1,565 @@
+name: DB Upgrade Automation | CREATE-NEW-POSTGRESQL-RDS-CLUSTER
+run-name: ${{ inputs.JOB_NAME }} for ${{ inputs.RDS_ID }}
+on:
+    workflow_dispatch:
+        inputs:
+            Environment:
+              description: "Which environment to run the automation on"
+              required: true
+              type: choice
+              options: ['prod', 'space']
+            RDS_ID:
+              description: "The ID of RDS that you need to update (Get from input file)"
+              required: true
+              type: string
+            JOB_NAME:
+              description: 'the name of job need to be run'
+              required: true
+              default: 'create-new-full-rds-cluster'
+              type: choice
+              options: ['create-read-replica', 'upgrade-read-replica', 'promote-read-replica', 'enable-multi-az', 'create-new-cluster-replicas', 'create-new-full-rds-cluster']
+
+env:
+    POD_WAIT_TIME_IN_SECONDS: 10
+    RDS_STATUS_WAIT_TIME_IN_SECONDS: 180
+
+jobs:
+    CREATE-READ-REPLICA:
+        runs-on: [dbz-runner-arm-v2-small]
+
+        if: |
+            contains('["gillesvdp-dbz", "mohamedelbahr", "ETGit39", "ahmad-khan-dbz", "amrabden", "andrei-aku", "anas-dbz"]', github.actor) && 
+            (github.event.inputs.JOB_NAME == 'create-read-replica' || (!cancelled() && success() && github.event.inputs.JOB_NAME == 'create-new-full-rds-cluster'))
+        steps:
+            - name: Checkout repository 👀
+              uses: actions/checkout@v4
+              with:
+                clean: true
+                
+            - name: Intialize Env
+              run: |
+                if [[ "${{inputs.Environment}}" == "prod" ]]; then
+                  echo "K8S_CONTEXT=arn:aws:eks:eu-west-1:847754352879:cluster/prod-eks-cluster" >> $GITHUB_ENV
+                  echo "ROLE_TO_ASSUME=arn:aws:iam::847754352879:role/CrossAccount_EKS_for_MENAOps" >> $GITHUB_ENV
+                elif [[ "${{inputs.Environment}}" == "space" ]]; then
+                  echo "K8S_CONTEXT=arn:aws:iam::857520607940:role/CrossAccount_EKS_for_MENAOps" >> $GITHUB_ENV
+                  echo "ROLE_TO_ASSUME=arn:aws:iam::857520607940:role/CrossAccount_EKS_for_MENAOps" >> $GITHUB_ENV
+                fi
+
+                rds_identifier=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".db_identifier')
+                old_postfix=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".old_postfix')
+                new_postfix=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".new_postfix')
+                current_db_version=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".current_db_version')
+                new_db_version=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".new_db_version')
+                master_instance_size=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".master_instance_size')
+                replica_instance_size=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".replica_instance_size')
+                rds_secret_name=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".rds_secret_name')
+                
+                if [[ -z $old_postfix || $old_postfix == '""' ]]; then
+                  echo "MAIN_RDS_IDENTIFIER=$rds_identifier" >> $GITHUB_ENV
+                else
+                  echo "MAIN_RDS_IDENTIFIER=$rds_identifier-$old_postfix" >> $GITHUB_ENV
+                fi
+
+                echo "NEW_RDS_IDENTIFIER=$rds_identifier-$new_postfix" >> $GITHUB_ENV
+                echo "CURRENT_DB_VERSION=$current_db_version" >> $GITHUB_ENV
+                echo "NEW_DB_VERSION=$new_db_version" >> $GITHUB_ENV
+                echo "NEW_MASTER_INSTANCE_SIZE=$master_instance_size" >> $GITHUB_ENV
+                echo "NEW_REPLICA_INSTANCE_SIZE=$replica_instance_size" >> $GITHUB_ENV
+                echo "RDS_SECRET_NAME=$rds_secret_name" >> $GITHUB_ENV
+
+            - name: Echo ENVs
+              run: |
+                echo "MAIN_RDS_IDENTIFIER:${{env.MAIN_RDS_IDENTIFIER}}"
+                echo "NEW_RDS_IDENTIFIER:${{env.NEW_RDS_IDENTIFIER}}"
+                echo "CURRENT_DB_VERSION:${{env.CURRENT_DB_VERSION}}"
+                echo "NEW_DB_VERSION:${{env.NEW_DB_VERSION}}"
+                echo "NEW_MASTER_INSTANCE_SIZE:${{env.NEW_MASTER_INSTANCE_SIZE}}"
+                echo "NEW_REPLICA_INSTANCE_SIZE:${{env.NEW_REPLICA_INSTANCE_SIZE}}"
+                echo "RDS_SECRET_NAME:${{env.RDS_SECRET_NAME}}"
+
+            - name: Configure AWS Credentials 🤐
+              uses: aws-actions/configure-aws-credentials@v4
+              with:
+                role-skip-session-tagging: true
+                aws-region: eu-west-1
+                role-to-assume: "${{env.ROLE_TO_ASSUME}}"
+                role-duration-seconds: 3600
+            - name: Create Read Replica
+              run: |
+                echo $'Getting some main rds data...\n'
+                master_rds_instance_data=$(aws rds describe-db-instances --db-instance-identifier ${{ env.MAIN_RDS_IDENTIFIER }})
+                # Get Master RDS SG
+                master_rds_sg=$(echo $master_rds_instance_data | jq -r '.DBInstances[0].VpcSecurityGroups[].VpcSecurityGroupId')
+                # Get Master RDS Instance Class
+                if [[ -z "${{ env.NEW_MASTER_INSTANCE_SIZE }}" ]]; then
+                  master_rds_instance_class=$(echo $master_rds_instance_data | jq -r '.DBInstances[0].DBInstanceClass')
+                else
+                  master_rds_instance_class="${{ env.NEW_MASTER_INSTANCE_SIZE }}"
+                fi
+                # Get Master RDS Subnet Group Name
+                master_rds_instance_subnet_groupname=$(echo $master_rds_instance_data | jq -r '.DBInstances[0].DBSubnetGroup.DBSubnetGroupName')
+                # Get Master RDS Engine Version
+                master_rds_engine_version=$(echo $master_rds_instance_data | jq -r '.DBInstances[0].EngineVersion')
+                # Get Master RDS Paramter Group
+                master_rds_parameter_groupname=$(echo $master_rds_instance_data | jq -r '.DBInstances[0].DBParameterGroups[0].DBParameterGroupName')
+
+                # Get Master RDS TAgs
+                master_rds_tags_keys=$(echo $master_rds_instance_data | jq -r '.DBInstances[0].TagList[].Key')
+                master_rds_tags_values=$(echo $master_rds_instance_data | jq -r '.DBInstances[0].TagList[].Value')
+                master_rds_tags_keys_list=($master_rds_tags_keys)
+                master_rds_tags_values_list=($master_rds_tags_values)
+
+                COUNTER=0
+                master_rds_tags_list=""
+                while [  $COUNTER -lt ${#master_rds_tags_keys_list[@]} ]; do
+                    master_rds_tags_list=$master_rds_tags_list"Key=${master_rds_tags_keys_list[COUNTER]},Value=${master_rds_tags_values_list[COUNTER]} "
+                    let COUNTER=$COUNTER+1 
+                done
+                
+                
+                # Create New RDS Replica
+                echo $'Create new rds replica...\n'
+                new_rds_creation_cmd_output=$(aws rds create-db-instance-read-replica \
+                                                    --db-instance-identifier ${{ env.NEW_RDS_IDENTIFIER }} \
+                                                    --source-db-instance-identifier ${{ env.MAIN_RDS_IDENTIFIER }} \
+                                                    --db-instance-class $master_rds_instance_class \
+                                                    --vpc-security-group-ids $master_rds_sg \
+                                                    --no-multi-az \
+                                                    --no-auto-minor-version-upgrade \
+                                                    --region eu-west-1)
+                echo $'RDS creation output\n-----------------------------------\n'
+                echo $new_rds_creation_cmd_output
+                echo $'=====================================================================================\n'
+                new_rds_status=$(aws rds describe-db-instances --db-instance-identifier ${{ env.NEW_RDS_IDENTIFIER }} | jq -r '.DBInstances[0].DBInstanceStatus')
+                while [ $new_rds_status != "available" ]
+                do
+                    echo "New RDS Status: $new_rds_status"
+                    echo "New rds replica is still not available"
+                    sleep $RDS_STATUS_WAIT_TIME_IN_SECONDS
+                    new_rds_status=$(aws rds describe-db-instances --db-instance-identifier ${{ env.NEW_RDS_IDENTIFIER }} | jq -r '.DBInstances[0].DBInstanceStatus')
+                done
+                echo $'New rds replica created successfully'
+    
+    UPGRADE-READ-REPLICA:
+        runs-on: [dbz-runner-arm-v2-small]
+        needs: CREATE-READ-REPLICA
+        if: |
+            contains('["gillesvdp-dbz", "mohamedelbahr", "ETGit39", "ahmad-khan-dbz", "amrabden", "andrei-aku", "anas-dbz"]', github.actor) && 
+            (github.event.inputs.JOB_NAME == 'upgrade-read-replica' || (!cancelled() && success() && github.event.inputs.JOB_NAME == 'create-new-full-rds-cluster'))
+        steps:
+            - name: Checkout repository 👀
+              uses: actions/checkout@v4
+              with:
+                clean: true
+                
+            - name: Intialize Env
+              run: |
+                if [[ "${{inputs.Environment}}" == "prod" ]]; then
+                  echo "K8S_CONTEXT=arn:aws:eks:eu-west-1:847754352879:cluster/prod-eks-cluster" >> $GITHUB_ENV
+                  echo "ROLE_TO_ASSUME=arn:aws:iam::847754352879:role/CrossAccount_EKS_for_MENAOps" >> $GITHUB_ENV
+                elif [[ "${{inputs.Environment}}" == "space" ]]; then
+                  echo "K8S_CONTEXT=arn:aws:iam::857520607940:role/CrossAccount_EKS_for_MENAOps" >> $GITHUB_ENV
+                  echo "ROLE_TO_ASSUME=arn:aws:iam::857520607940:role/CrossAccount_EKS_for_MENAOps" >> $GITHUB_ENV
+                fi
+
+                rds_identifier=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".db_identifier')
+                old_postfix=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".old_postfix')
+                new_postfix=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".new_postfix')
+                current_db_version=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".current_db_version')
+                new_db_version=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".new_db_version')
+                master_instance_size=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".master_instance_size')
+                replica_instance_size=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".replica_instance_size')
+                rds_secret_name=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".rds_secret_name')
+                
+                if [[ -z $old_postfix || $old_postfix == '""' ]]; then
+                  echo "MAIN_RDS_IDENTIFIER=$rds_identifier" >> $GITHUB_ENV
+                else
+                  echo "MAIN_RDS_IDENTIFIER=$rds_identifier-$old_postfix" >> $GITHUB_ENV
+                fi
+                echo "NEW_RDS_IDENTIFIER=$rds_identifier-$new_postfix" >> $GITHUB_ENV
+                echo "CURRENT_DB_VERSION=$current_db_version" >> $GITHUB_ENV
+                echo "NEW_DB_VERSION=$new_db_version" >> $GITHUB_ENV
+                echo "NEW_MASTER_INSTANCE_SIZE=$master_instance_size" >> $GITHUB_ENV
+                echo "NEW_REPLICA_INSTANCE_SIZE=$replica_instance_size" >> $GITHUB_ENV
+                echo "RDS_SECRET_NAME=$rds_secret_name" >> $GITHUB_ENV
+
+            - name: Echo ENVs
+              run: |
+                echo "MAIN_RDS_IDENTIFIER:${{env.MAIN_RDS_IDENTIFIER}}"
+                echo "NEW_RDS_IDENTIFIER:${{env.NEW_RDS_IDENTIFIER}}"
+                echo "CURRENT_DB_VERSION:${{env.CURRENT_DB_VERSION}}"
+                echo "NEW_DB_VERSION:${{env.NEW_DB_VERSION}}"
+                echo "NEW_MASTER_INSTANCE_SIZE:${{env.NEW_MASTER_INSTANCE_SIZE}}"
+                echo "NEW_REPLICA_INSTANCE_SIZE:${{env.NEW_REPLICA_INSTANCE_SIZE}}"
+                echo "RDS_SECRET_NAME:${{env.RDS_SECRET_NAME}}"
+
+            - name: Configure AWS Credentials 🤐
+              uses: aws-actions/configure-aws-credentials@v4
+              with:
+                role-skip-session-tagging: true
+                aws-region: eu-west-1
+                role-to-assume: "${{env.ROLE_TO_ASSUME}}"
+                role-duration-seconds: 3600
+            - name: Upgrade Read Replica
+              run: |
+                # Validate Current Engine Version
+                new_rds_instance_data=$(aws rds describe-db-instances --db-instance-identifier ${{ env.NEW_RDS_IDENTIFIER }})
+                new_rds_instance_engine_version=$(echo $new_rds_instance_data | jq -r '.DBInstances[0].EngineVersion')
+                if [ "$new_rds_instance_engine_version" != "${{ env.CURRENT_DB_VERSION }}" ]
+                then
+                    echo $'Current DB Version of new RDS not matching the input'
+                    exit 1
+                fi
+
+                # Upgrade New RDS
+                echo $'Upgrade engine version of the new rds replica...\n'
+                new_rds_upgrade_cmd_output=$(aws rds modify-db-instance \
+                                                    --db-instance-identifier ${{ env.NEW_RDS_IDENTIFIER }} \
+                                                    --engine-version ${{ env.NEW_DB_VERSION }} \
+                                                    --allow-major-version-upgrade \
+                                                    --apply-immediately \
+                                                    --region eu-west-1)
+                
+                echo $'RDS Upgrade output\n-----------------------------------\n'
+                echo $new_rds_upgrade_cmd_output
+                echo $'=====================================================================================\n'
+
+                new_rds_engine_version=$(aws rds describe-db-instances --db-instance-identifier ${{ env.NEW_RDS_IDENTIFIER }} | jq -r '.DBInstances[0].EngineVersion')
+                while [ "$new_rds_engine_version" != "${{ env.NEW_DB_VERSION }}" ]
+                do
+                    echo "New RDS Version: $new_rds_engine_version"
+                    echo "New rds replica version is still not updated"
+                    sleep 120
+                    new_rds_engine_version=$(aws rds describe-db-instances --db-instance-identifier ${{ env.NEW_RDS_IDENTIFIER }} | jq -r '.DBInstances[0].EngineVersion')
+                done
+
+
+                new_rds_status=$(aws rds describe-db-instances --db-instance-identifier ${{ env.NEW_RDS_IDENTIFIER }} | jq -r '.DBInstances[0].DBInstanceStatus')
+                while [ $new_rds_status != "available" ]
+                do
+                    echo "New RDS Status: $new_rds_status"
+                    echo "New rds replica is still not available"
+                    sleep 120
+                    new_rds_status=$(aws rds describe-db-instances --db-instance-identifier ${{ env.NEW_RDS_IDENTIFIER }} | jq -r '.DBInstances[0].DBInstanceStatus')
+                done
+
+                echo $'New rds replica Upgraded successfully'
+    
+    PROMOTE-READ-REPLICA:
+        runs-on: [dbz-runner-arm-v2-small]
+        needs: UPGRADE-READ-REPLICA
+        if: |
+            contains('["gillesvdp-dbz", "mohamedelbahr", "ETGit39", "ahmad-khan-dbz", "amrabden", "andrei-aku", "anas-dbz"]', github.actor) && 
+            (github.event.inputs.JOB_NAME == 'promote-read-replica' || (!cancelled() && success() && github.event.inputs.JOB_NAME == 'create-new-full-rds-cluster'))
+        outputs:
+          relay_source_log_file: ${{ steps.rds_stop_replication.outputs.relay_source_log_file }}
+          exec_source_log_pos: ${{ steps.rds_stop_replication.outputs.exec_source_log_pos }}
+        steps:
+            - name: Checkout repository 👀
+              uses: actions/checkout@v4
+              with:
+                clean: true
+                
+            - name: Intialize Env
+              run: |
+                if [[ "${{inputs.Environment}}" == "prod" ]]; then
+                  echo "K8S_CONTEXT=arn:aws:eks:eu-west-1:847754352879:cluster/prod-eks-cluster" >> $GITHUB_ENV
+                  echo "ROLE_TO_ASSUME=arn:aws:iam::847754352879:role/CrossAccount_EKS_for_MENAOps" >> $GITHUB_ENV
+                elif [[ "${{inputs.Environment}}" == "space" ]]; then
+                  echo "K8S_CONTEXT=arn:aws:iam::857520607940:role/CrossAccount_EKS_for_MENAOps" >> $GITHUB_ENV
+                  echo "ROLE_TO_ASSUME=arn:aws:iam::857520607940:role/CrossAccount_EKS_for_MENAOps" >> $GITHUB_ENV
+                fi
+
+                rds_identifier=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".db_identifier')
+                old_postfix=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".old_postfix')
+                new_postfix=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".new_postfix')
+                current_db_version=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".current_db_version')
+                new_db_version=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".new_db_version')
+                master_instance_size=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".master_instance_size')
+                replica_instance_size=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".replica_instance_size')
+                rds_secret_name=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".rds_secret_name')
+
+                if [[ -z $old_postfix || $old_postfix == '""' ]]; then
+                  echo "MAIN_RDS_IDENTIFIER=$rds_identifier" >> $GITHUB_ENV
+                else
+                  echo "MAIN_RDS_IDENTIFIER=$rds_identifier-$old_postfix" >> $GITHUB_ENV
+                fi
+                echo "NEW_RDS_IDENTIFIER=$rds_identifier-$new_postfix" >> $GITHUB_ENV
+                echo "CURRENT_DB_VERSION=$current_db_version" >> $GITHUB_ENV
+                echo "NEW_DB_VERSION=$new_db_version" >> $GITHUB_ENV
+                echo "NEW_MASTER_INSTANCE_SIZE=$master_instance_size" >> $GITHUB_ENV
+                echo "NEW_REPLICA_INSTANCE_SIZE=$replica_instance_size" >> $GITHUB_ENV
+                echo "RDS_SECRET_NAME=$rds_secret_name" >> $GITHUB_ENV
+
+            - name: Echo ENVs
+              run: |
+                echo "MAIN_RDS_IDENTIFIER:${{env.MAIN_RDS_IDENTIFIER}}"
+                echo "NEW_RDS_IDENTIFIER:${{env.NEW_RDS_IDENTIFIER}}"
+                echo "CURRENT_DB_VERSION:${{env.CURRENT_DB_VERSION}}"
+                echo "NEW_DB_VERSION:${{env.NEW_DB_VERSION}}"
+                echo "NEW_MASTER_INSTANCE_SIZE:${{env.NEW_MASTER_INSTANCE_SIZE}}"
+                echo "NEW_REPLICA_INSTANCE_SIZE:${{env.NEW_REPLICA_INSTANCE_SIZE}}"
+                echo "RDS_SECRET_NAME:${{env.RDS_SECRET_NAME}}"
+
+            - name: Configure AWS Credentials 🤐
+              uses: aws-actions/configure-aws-credentials@v4
+              with:
+                role-skip-session-tagging: true
+                aws-region: eu-west-1
+                role-to-assume: "${{env.ROLE_TO_ASSUME}}"
+                role-duration-seconds: 3600
+            - name: Install Kubectl
+              uses: azure/setup-kubectl@v3
+              with:
+                version: 'v1.28.0'
+            - name: Configure Kubectl
+              uses: azure/k8s-set-context@v3
+              with:
+                  method: kubeconfig
+                  kubeconfig: ${{ secrets.KUBE_CONFIG }}
+                  context: ${{ env.K8S_CONTEXT }}
+            - name: Promote Read Replica
+              run: |
+                # Promote New RDS
+                echo $'Promote the new RDS...\n'
+                new_rds_promote_cmd_output=$(aws rds promote-read-replica \
+                                                    --db-instance-identifier ${{ env.NEW_RDS_IDENTIFIER }} \
+                                                    --region eu-west-1)
+                echo $'RDS Promotion Output\n--------------------------------------\n'
+                echo $new_rds_promote_cmd_output
+                echo $'====================================================================================\n'
+                # Intial sleep before getting status as it delays around 1 minute before starting promotion
+                sleep $RDS_STATUS_WAIT_TIME_IN_SECONDS
+                new_rds_status=$(aws rds describe-db-instances --db-instance-identifier ${{ env.NEW_RDS_IDENTIFIER }} | jq -r '.DBInstances[0].DBInstanceStatus')
+                while [ $new_rds_status != "available" ]
+                do
+                    echo "New RDS Status: $new_rds_status"
+                    echo "New rds replica is still not available"
+                    sleep $RDS_STATUS_WAIT_TIME_IN_SECONDS
+                    new_rds_status=$(aws rds describe-db-instances --db-instance-identifier ${{ env.NEW_RDS_IDENTIFIER }} | jq -r '.DBInstances[0].DBInstanceStatus')
+                done
+                echo $'New rds replica Promoted successfully'
+      
+    ENABLE-MULTI-AZ:
+        runs-on: [dbz-runner-arm-v2-small]
+        needs: PROMOTE-READ-REPLICA
+        if: |
+            contains('["gillesvdp-dbz", "mohamedelbahr", "ETGit39", "ahmad-khan-dbz", "amrabden", "andrei-aku", "anas-dbz"]', github.actor) && 
+            (github.event.inputs.JOB_NAME == 'enable-multi-az' || (!cancelled() && success() && github.event.inputs.JOB_NAME == 'create-new-full-rds-cluster'))
+        steps:
+            - name: Checkout repository 👀
+              uses: actions/checkout@v4
+              with:
+                clean: true
+                
+            - name: Intialize Env
+              run: |
+                if [[ "${{inputs.Environment}}" == "prod" ]]; then
+                  echo "K8S_CONTEXT=arn:aws:eks:eu-west-1:847754352879:cluster/prod-eks-cluster" >> $GITHUB_ENV
+                  echo "ROLE_TO_ASSUME=arn:aws:iam::847754352879:role/CrossAccount_EKS_for_MENAOps" >> $GITHUB_ENV
+                elif [[ "${{inputs.Environment}}" == "space" ]]; then
+                  echo "K8S_CONTEXT=arn:aws:iam::857520607940:role/CrossAccount_EKS_for_MENAOps" >> $GITHUB_ENV
+                  echo "ROLE_TO_ASSUME=arn:aws:iam::857520607940:role/CrossAccount_EKS_for_MENAOps" >> $GITHUB_ENV
+                fi
+
+                rds_identifier=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".db_identifier')
+                old_postfix=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".old_postfix')
+                new_postfix=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".new_postfix')
+                current_db_version=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".current_db_version')
+                new_db_version=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".new_db_version')
+                master_instance_size=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".master_instance_size')
+                replica_instance_size=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".replica_instance_size')
+                rds_secret_name=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".rds_secret_name')
+
+                if [[ -z $old_postfix || $old_postfix == '""' ]]; then
+                  echo "MAIN_RDS_IDENTIFIER=$rds_identifier" >> $GITHUB_ENV
+                else
+                  echo "MAIN_RDS_IDENTIFIER=$rds_identifier-$old_postfix" >> $GITHUB_ENV
+                fi
+                echo "NEW_RDS_IDENTIFIER=$rds_identifier-$new_postfix" >> $GITHUB_ENV
+                echo "CURRENT_DB_VERSION=$current_db_version" >> $GITHUB_ENV
+                echo "NEW_DB_VERSION=$new_db_version" >> $GITHUB_ENV
+                echo "NEW_MASTER_INSTANCE_SIZE=$master_instance_size" >> $GITHUB_ENV
+                echo "NEW_REPLICA_INSTANCE_SIZE=$replica_instance_size" >> $GITHUB_ENV
+                echo "RDS_SECRET_NAME=$rds_secret_name" >> $GITHUB_ENV
+
+            - name: Echo ENVs
+              run: |
+                echo "MAIN_RDS_IDENTIFIER:${{env.MAIN_RDS_IDENTIFIER}}"
+                echo "NEW_RDS_IDENTIFIER:${{env.NEW_RDS_IDENTIFIER}}"
+                echo "CURRENT_DB_VERSION:${{env.CURRENT_DB_VERSION}}"
+                echo "NEW_DB_VERSION:${{env.NEW_DB_VERSION}}"
+                echo "NEW_MASTER_INSTANCE_SIZE:${{env.NEW_MASTER_INSTANCE_SIZE}}"
+                echo "NEW_REPLICA_INSTANCE_SIZE:${{env.NEW_REPLICA_INSTANCE_SIZE}}"
+                echo "RDS_SECRET_NAME:${{env.RDS_SECRET_NAME}}"
+
+            - name: Configure AWS Credentials 🤐
+              uses: aws-actions/configure-aws-credentials@v4
+              with:
+                role-skip-session-tagging: true
+                aws-region: eu-west-1
+                role-to-assume: "${{env.ROLE_TO_ASSUME}}"
+                role-duration-seconds: 3600
+            - name: Enable Multi-AZ
+              run: |
+                echo $'Enable Multi-AZ of the new rds replica...\n'
+                new_rds_modify_cmd_output=$(aws rds modify-db-instance \
+                                                    --db-instance-identifier ${{ env.NEW_RDS_IDENTIFIER }} \
+                                                    --multi-az \
+                                                    --apply-immediately \
+                                                    --region eu-west-1)
+                
+                echo $'RDS Upgrade output\n-----------------------------------\n'
+                echo $new_rds_modify_cmd_output
+                echo $'=====================================================================================\n'
+
+                sleep 60
+                new_rds_status=$(aws rds describe-db-instances --db-instance-identifier ${{ env.NEW_RDS_IDENTIFIER }} | jq -r '.DBInstances[0].DBInstanceStatus')
+                while [ $new_rds_status != "available" ]
+                do
+                    echo "New RDS Status: $new_rds_status"
+                    echo "New rds replica is still not available"
+                    sleep 120
+                    new_rds_status=$(aws rds describe-db-instances --db-instance-identifier ${{ env.NEW_RDS_IDENTIFIER }} | jq -r '.DBInstances[0].DBInstanceStatus')
+                done
+
+                echo $'Multi-AZ enabled on new RDS successfully'   
+    
+    CREATE-NEW-CLUSTER-REPLICAS:
+      runs-on: [dbz-runner-arm-v2-small]
+      needs: ENABLE-MULTI-AZ
+      if: |
+          contains('["gillesvdp-dbz", "mohamedelbahr", "ETGit39", "ahmad-khan-dbz", "amrabden", "andrei-aku", "anas-dbz"]', github.actor) && 
+          (github.event.inputs.JOB_NAME == 'create-new-cluster-replicas' || (!cancelled() && success() && github.event.inputs.JOB_NAME == 'create-new-full-rds-cluster'))
+      steps:
+          - name: Checkout repository 👀
+            uses: actions/checkout@v4
+            with:
+              clean: true
+              
+          - name: Intialize Env
+            run: |
+              if [[ "${{inputs.Environment}}" == "prod" ]]; then
+                echo "K8S_CONTEXT=arn:aws:eks:eu-west-1:847754352879:cluster/prod-eks-cluster" >> $GITHUB_ENV
+                echo "ROLE_TO_ASSUME=arn:aws:iam::847754352879:role/CrossAccount_EKS_for_MENAOps" >> $GITHUB_ENV
+              elif [[ "${{inputs.Environment}}" == "space" ]]; then
+                echo "K8S_CONTEXT=arn:aws:iam::857520607940:role/CrossAccount_EKS_for_MENAOps" >> $GITHUB_ENV
+                echo "ROLE_TO_ASSUME=arn:aws:iam::857520607940:role/CrossAccount_EKS_for_MENAOps" >> $GITHUB_ENV
+              fi
+
+              rds_identifier=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".db_identifier')
+              old_postfix=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".old_postfix')
+              new_postfix=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".new_postfix')
+              current_db_version=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".current_db_version')
+              new_db_version=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".new_db_version')
+              master_instance_size=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".master_instance_size')
+              replica_instance_size=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".replica_instance_size')
+              rds_secret_name=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".rds_secret_name')
+
+              if [[ -z $old_postfix || $old_postfix == '""' ]]; then
+                echo "MAIN_RDS_IDENTIFIER=$rds_identifier" >> $GITHUB_ENV
+              else
+                echo "MAIN_RDS_IDENTIFIER=$rds_identifier-$old_postfix" >> $GITHUB_ENV
+              fi
+              echo "NEW_RDS_IDENTIFIER=$rds_identifier-$new_postfix" >> $GITHUB_ENV
+              echo "CURRENT_DB_VERSION=$current_db_version" >> $GITHUB_ENV
+              echo "NEW_DB_VERSION=$new_db_version" >> $GITHUB_ENV
+              echo "NEW_MASTER_INSTANCE_SIZE=$master_instance_size" >> $GITHUB_ENV
+              echo "NEW_REPLICA_INSTANCE_SIZE=$replica_instance_size" >> $GITHUB_ENV
+              echo "RDS_SECRET_NAME=$rds_secret_name" >> $GITHUB_ENV
+
+          - name: Echo ENVs
+            run: |
+              echo "MAIN_RDS_IDENTIFIER:${{env.MAIN_RDS_IDENTIFIER}}"
+              echo "NEW_RDS_IDENTIFIER:${{env.NEW_RDS_IDENTIFIER}}"
+              echo "CURRENT_DB_VERSION:${{env.CURRENT_DB_VERSION}}"
+              echo "NEW_DB_VERSION:${{env.NEW_DB_VERSION}}"
+              echo "NEW_MASTER_INSTANCE_SIZE:${{env.NEW_MASTER_INSTANCE_SIZE}}"
+              echo "NEW_REPLICA_INSTANCE_SIZE:${{env.NEW_REPLICA_INSTANCE_SIZE}}"
+              echo "RDS_SECRET_NAME:${{env.RDS_SECRET_NAME}}"
+
+          - name: Configure AWS Credentials 🤐
+            uses: aws-actions/configure-aws-credentials@v4
+            with:
+              role-skip-session-tagging: true
+              aws-region: eu-west-1
+              role-to-assume: "${{env.ROLE_TO_ASSUME}}"
+              role-duration-seconds: 3600
+          - name: Create Replicas
+            run: |
+              current_replicas_count=$(aws rds describe-db-instances --db-instance-identifier  ${{ env.MAIN_RDS_IDENTIFIER }} | jq -r '.DBInstances[0].ReadReplicaDBInstanceIdentifiers[]' | wc -l)
+              echo "Number of replicas for current RDS: $current_replicas_count"
+              if [ $current_replicas_count -gt 0 ]; then
+                first_replica=$(aws rds describe-db-instances --db-instance-identifier ${{ env.MAIN_RDS_IDENTIFIER }} | jq -r '.DBInstances[0].ReadReplicaDBInstanceIdentifiers[0]')
+                # Get Replica Data
+                replica_data=$(aws rds describe-db-instances --db-instance-identifier $first_replica)
+                # Get Replica Parameter Group
+                replica_parameter_groupname=$(echo $replica_data | jq -r '.DBInstances[0].DBParameterGroups[0].DBParameterGroupName')
+                
+                # Get Replica Instance Class
+                if [[ -z "${{ env.NEW_REPLICA_INSTANCE_SIZE }}" ]]; then
+                  replica_instance_class=$(echo $replica_data | jq -r '.DBInstances[0].DBInstanceClass')
+                else
+                  replica_instance_class="${{ env.NEW_REPLICA_INSTANCE_SIZE }}"
+                fi
+
+                # Get Replica Security Group
+                replica_instance_sg=$(echo $replica_data | jq -r '.DBInstances[0].VpcSecurityGroups[].VpcSecurityGroupId')
+
+                # Get Replica Backup Settings
+                replica_maintenance_window=$(echo $replica_data | jq -r '.DBInstances[0].PreferredMaintenanceWindow')
+                replica_backup_window=$(echo $replica_data | jq -r '.DBInstances[0].PreferredBackupWindow')
+                replica_backup_retention_period=$(echo $replica_data | jq -r '.DBInstances[0].BackupRetentionPeriod')
+                
+                COUNTER=0
+                while [  $COUNTER -lt $current_replicas_count ]; do
+                  let COUNTER=$COUNTER+1
+                  new_replica_identifier="${{ env.NEW_RDS_IDENTIFIER }}-replica-$COUNTER"
+                  echo "creating $new_replica_identifier ..."
+                  new_rds_creation_cmd_output=$(aws rds create-db-instance-read-replica \
+                                                  --db-instance-identifier $new_replica_identifier \
+                                                  --source-db-instance-identifier ${{ env.NEW_RDS_IDENTIFIER }} \
+                                                  --db-instance-class $replica_instance_class \
+                                                  --vpc-security-group-ids $replica_instance_sg \
+                                                  --no-multi-az \
+                                                  --no-auto-minor-version-upgrade \
+                                                  --region eu-west-1)
+                  echo $'RDS creation output\n-----------------------------------\n'
+                  echo $new_rds_creation_cmd_output
+                  echo $'=====================================================================================\n'
+                  
+                  echo "Getting new replica status..."
+                  new_rds_status=$(aws rds describe-db-instances --db-instance-identifier $new_replica_identifier | jq -r '.DBInstances[0].DBInstanceStatus')
+                  while [ $new_rds_status != "available" ]
+                  do
+                      echo "New RDS Status: $new_rds_status"
+                      echo "New rds replica is still not available"
+                      sleep $RDS_STATUS_WAIT_TIME_IN_SECONDS
+                      new_rds_status=$(aws rds describe-db-instances --db-instance-identifier $new_replica_identifier | jq -r '.DBInstances[0].DBInstanceStatus')
+                  done
+                  echo $'New rds replica created successfully'
+
+                  echo "Updating $new_replica_identifier backup config..."
+                  new_rds_upgrade_cmd_output=$(aws rds modify-db-instance \
+                                                    --db-instance-identifier $new_replica_identifier \
+                                                    --db-parameter-group-name $replica_parameter_groupname \
+                                                    --backup-retention-period $replica_backup_retention_period \
+                                                    --preferred-backup-window $replica_backup_window \
+                                                    --preferred-maintenance-window $replica_maintenance_window \
+                                                    --apply-immediately \
+                                                    --region eu-west-1)
+
+                    # Handle case of pending reboot
+                    sleep 20s
+                    new_replica_current_pg_status=$(aws rds describe-db-instances --db-instance-identifier $new_replica_identifier | jq -r '.DBInstances[0].DBParameterGroups[0].ParameterApplyStatus')
+                    if [ "$new_replica_current_pg_status" == "pending-reboot" ]; then
+                        echo "Reboot the new replica to reflect parameter group update..."
+                        aws rds reboot-db-instance --db-instance-identifier $new_replica_identifier
+                    fi
+                done
+
+              else
+                echo "No replicas found for current RDS"
+              fi
+  

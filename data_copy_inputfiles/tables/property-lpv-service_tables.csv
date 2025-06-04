@@ -1,0 +1,8 @@
+TARGETED_TABLES
+core_category
+core_place
+core_place_nearby_places
+core_tag
+core_taggroup
+django_content_type
+django_migrations

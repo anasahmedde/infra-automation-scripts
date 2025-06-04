@@ -1,0 +1,19 @@
+name: Restoration Workflow
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Select an environment to restore from space'
+        required: true
+        type: choice
+        options: ['beta-cc']
+
+jobs:
+  create-snapshot:
+    runs-on: [self-hosted, dbz-runner-arm-v2-small]
+    steps:
+      - name: skeletal workflow
+        run: echo "This is a skeletal workflow"
+
+

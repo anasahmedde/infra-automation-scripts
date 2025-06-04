@@ -1,0 +1,7 @@
+TARGETED_TABLES
+place_alias
+place_nearbyplaces
+place_place
+place_placeattributes
+django_content_type
+django_migrations

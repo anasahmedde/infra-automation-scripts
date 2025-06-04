@@ -1,0 +1,75 @@
+name: Data-Copy | Orchestrator
+
+on:
+  workflow_dispatch:
+    inputs:
+      SOURCE_ENVIRONMENT:
+        description: 'Select a source environment to dump [schema + data]'
+        required: true
+        type: choice
+        options: ['beta-cc', 'prod']
+      DESTINATION_ENVIRONMENT:
+        description: 'Select a destination environment to drop db and restore [schema + data]'
+        required: true
+        type: choice
+        options: ['beta-cc', 'beta-me', 'beta-nl', 'beta-pro', 'beta-pw', 'beta-bid', 'beta-red']
+
+env:
+    SOURCE_S3_BUCKET_PREFIX: "dbz-data-copy"
+
+jobs:
+  INITIALIZE:
+    runs-on: [self-hosted, dbz-runner-amd-v2-small]
+    outputs:
+      SOURCE_S3_BUCKET: ${{ steps.set_env_var.outputs.SOURCE_S3_BUCKET }}
+    steps:
+    - name: Set Env Variable
+      id: set_env_var
+      run: |
+        if [[ "${{inputs.SOURCE_ENVIRONMENT}}" == "prod" ]]; then
+          SOURCE_S3_BUCKET=${SOURCE_S3_BUCKET_PREFIX}-prod
+          echo "SOURCE_S3_BUCKET=${SOURCE_S3_BUCKET}" >> $GITHUB_OUTPUT
+
+        elif [[ "${{inputs.SOURCE_ENVIRONMENT}}" == "beta-cc" ]]; then
+          SOURCE_S3_BUCKET=${SOURCE_S3_BUCKET_PREFIX}-test
+          echo "SOURCE_S3_BUCKET=${SOURCE_S3_BUCKET}" >> $GITHUB_OUTPUT
+  
+        else
+            echo "Wrong/Invalid Environment"
+            exit 1
+        fi
+
+  DUMP_DB_SCHEMA_PIPELINE:
+    uses: dbz/infra-automation/.github/workflows/data_copy_prod_dump_db_schema.yml@main
+    with:
+      Environment: ${{inputs.SOURCE_ENVIRONMENT}}
+    secrets: inherit
+
+  DUMP_TABLES_DATA_PIPELINE:
+    uses: dbz/infra-automation/.github/workflows/data_copy_prod_dump_tables_data.yml@main
+    with:
+      Environment: ${{inputs.SOURCE_ENVIRONMENT}}
+    secrets: inherit
+
+  DROP_DB_PIPELINE:
+    needs: [DUMP_DB_SCHEMA_PIPELINE, DUMP_TABLES_DATA_PIPELINE]
+    uses: dbz/infra-automation/.github/workflows/data_copy_lower_env_drop_db.yml@main
+    with:
+      Environment: ${{inputs.DESTINATION_ENVIRONMENT}}
+    secrets: inherit
+
+  RESTORE_DB_SCHEMA_PIPELINE:
+    needs: [INITIALIZE, DROP_DB_PIPELINE]
+    uses: dbz/infra-automation/.github/workflows/data_copy_lower_env_restore_db_schema.yml@main
+    with:
+      Environment: ${{inputs.DESTINATION_ENVIRONMENT}}
+      SOURCE_S3_BUCKET: ${{ needs.INITIALIZE.outputs.SOURCE_S3_BUCKET }}
+    secrets: inherit
+
+  RESTORE_TABLES_DATA_PIPELINE:
+    needs: [INITIALIZE, RESTORE_DB_SCHEMA_PIPELINE]
+    uses: dbz/infra-automation/.github/workflows/data_copy_lower_env_restore_tables_data.yml@main
+    with:
+      Environment: ${{inputs.DESTINATION_ENVIRONMENT}}
+      SOURCE_S3_BUCKET: ${{ needs.INITIALIZE.outputs.SOURCE_S3_BUCKET }}
+    secrets: inherit

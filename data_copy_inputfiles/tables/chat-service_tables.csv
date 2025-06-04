@@ -1,0 +1,4 @@
+TARGETED_TABLES
+core_category
+django_content_type
+django_migrations

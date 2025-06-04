@@ -1,0 +1,101 @@
+name: DB Upgrade Automation | CHECK-REPLICATION-STATUS
+run-name: CHECK-REPLICATION-STATUS for ${{ inputs.RDS_ID }}
+on:
+    workflow_dispatch:
+        inputs:
+            Environment:
+              description: "Which environment to run the automation on"
+              required: true
+              type: choice
+              options: ['prod', 'space']
+            RDS_ID:
+              description: "The ID of RDS that you need to check (Get from input file)"
+              required: true
+              type: string
+            
+
+env:
+    MYSQL_CLIENT_POD_NAME_PREFIX: "db-upgrade-client"
+    POD_WAIT_TIME_IN_SECONDS: 10
+
+jobs:
+    CHECK-REPLICATION-STATUS:
+        runs-on: [dbz-runner-amd-v2-small]
+        if: contains('["gillesvdp-dbz", "mohamedelbahr", "ETGit39", "ahmad-khan-dbz", "amrabden", "andrei-aku", "anas-dbz"]', github.actor)
+        steps:
+            - name: Checkout repository 👀
+              uses: actions/checkout@v4
+              with:
+                clean: true
+            - name: Intialize Env
+              run: |
+                if [[ "${{inputs.Environment}}" == "prod" ]]; then
+                  echo "K8S_CONTEXT=arn:aws:eks:eu-west-1:847754352879:cluster/prod-eks-cluster" >> $GITHUB_ENV
+                  echo "ROLE_TO_ASSUME=arn:aws:iam::847754352879:role/CrossAccount_EKS_for_MENAOps" >> $GITHUB_ENV
+                elif [[ "${{inputs.Environment}}" == "space" ]]; then
+                  echo "K8S_CONTEXT=arn:aws:eks:eu-west-1:857520607940:cluster/space-eks-cluster" >> $GITHUB_ENV
+                  echo "ROLE_TO_ASSUME=arn:aws:iam::857520607940:role/CrossAccount_EKS_for_MENAOps" >> $GITHUB_ENV
+                fi
+
+                rds_identifier=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".db_identifier')
+                new_postfix=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".new_postfix')
+                rds_secret_name=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".rds_secret_name')
+
+                echo "RDS_IDENTIFER=$rds_identifier-$new_postfix" >> $GITHUB_ENV
+                echo "RDS_SECRET_NAME=$rds_secret_name" >> $GITHUB_ENV
+
+            - name: Echo ENVs
+              run: |
+                echo "RDS_IDENTIFER:${{env.RDS_IDENTIFER}}"
+                echo "RDS_SECRET_NAME:${{env.RDS_SECRET_NAME}}"
+            - name: Configure AWS Credentials 🤐
+              uses: aws-actions/configure-aws-credentials@v4
+              with:
+                role-skip-session-tagging: true
+                aws-region: eu-west-1
+                role-to-assume: ${{ env.ROLE_TO_ASSUME }}
+                role-duration-seconds: 3600
+            - name: Install Kubectl
+              uses: azure/setup-kubectl@v3
+              with:
+                version: 'v1.28.0'
+            - name: Configure Kubectl
+              uses: azure/k8s-set-context@v3
+              with:
+                method: kubeconfig
+                kubeconfig: ${{ secrets.KUBE_CONFIG }}
+                context: ${{ env.K8S_CONTEXT }}
+            - name: Check Replication Status
+              run: |
+                MYSQL_CLIENT_POD_NAME="$MYSQL_CLIENT_POD_NAME_PREFIX-${{env.RDS_IDENTIFER}}"
+                
+
+                # Get RDS Endpoint
+                rds_instance_endpoint=$( aws rds describe-db-instances --db-instance-identifier ${{ env.RDS_IDENTIFER }} | jq -r '.DBInstances[0].Endpoint.Address')
+                db_port=3306
+
+                # Get Master RDS Credentials
+                rds_username=$( aws secretsmanager get-secret-value --secret-id db-upgrade-secrets/${{ env.RDS_SECRET_NAME }} | jq -r '.SecretString| fromjson' | jq -r '.username' )
+                rds_password=$( aws secretsmanager get-secret-value --secret-id db-upgrade-secrets/${{ env.RDS_SECRET_NAME }} | jq -r '.SecretString| fromjson' | jq -r '.password' )
+
+                # Create mysql client pod on the cluster
+                pod_exist=$(kubectl get pods -n infra | grep $MYSQL_CLIENT_POD_NAME | { grep -v grep || true; } )
+                if [[ -z "$pod_exist" ]]; then
+                    kubectl run -n infra $MYSQL_CLIENT_POD_NAME --image=mysql --restart=Never --env=MYSQL_ALLOW_EMPTY_PASSWORD=true
+                    sleep $POD_WAIT_TIME_IN_SECONDS
+                fi
+
+                echo "Check Replication Stauts..."
+                echo "---------------------------------------"
+                kubectl exec -n infra -it $MYSQL_CLIENT_POD_NAME -- mysql --host="$rds_instance_endpoint" --user=$rds_username --password=$rds_password --execute="show replica status\G;" > replica_status_output.txt
+                cat replica_status_output.txt
+                relay_source_log_file=$(cat replica_status_output.txt | grep Relay_Source_Log_File | awk '{print $2}')
+                exec_source_log_pos=$(cat replica_status_output.txt | grep Exec_Source_Log_Pos | awk '{print $2}')
+                seconds_behind_source_rds=$(cat replica_status_output.txt | grep Seconds_Behind_Source | awk '{print $2}')
+                
+                echo "::notice title=SECONDS_BEHIND_SOURCE::$seconds_behind_source_rds"
+                echo "::notice title=RELAY_SOURCE_LOG_FILE::$relay_source_log_file"
+                echo "::notice title=EXEC_SOURCE_LOG_POS::$exec_source_log_pos"
+
+                kubectl delete -n infra pod/$MYSQL_CLIENT_POD_NAME
+    

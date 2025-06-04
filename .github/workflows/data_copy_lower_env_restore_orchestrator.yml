@@ -1,0 +1,39 @@
+name: Data-Copy | Lower-Env | Restore-Orchestrator
+
+on:
+  workflow_dispatch:
+    inputs:
+      Environment:
+        description: 'Select an environment to drop db and restore [schema + data]'
+        required: true
+        type: choice
+        options: ['beta-cc', 'beta-me', 'beta-nl', 'beta-pro', 'beta-pw', 'beta-bid', 'beta-red']
+      SOURCE_S3_BUCKET:
+        description: 'Select S3 bucket source to restore schema dump in selected environment'
+        required: true
+        type: choice
+        options: ['dbz-data-copy-test','dbz-data-copy-prod']
+
+jobs:
+
+  DROP_DB_PIPELINE:
+    uses: dbz/infra-automation/.github/workflows/data_copy_lower_env_drop_db.yml@main
+    with:
+      Environment: ${{inputs.Environment}}
+    secrets: inherit
+
+  RESTORE_DB_SCHEMA_PIPELINE:
+    needs: [DROP_DB_PIPELINE]
+    uses: dbz/infra-automation/.github/workflows/data_copy_lower_env_restore_db_schema.yml@main
+    with:
+      Environment: ${{inputs.Environment}}
+      SOURCE_S3_BUCKET: ${{inputs.SOURCE_S3_BUCKET}}
+    secrets: inherit
+
+  RESTORE_TABLES_DATA_PIPELINE:
+    needs: [RESTORE_DB_SCHEMA_PIPELINE]
+    uses: dbz/infra-automation/.github/workflows/data_copy_lower_env_restore_tables_data.yml@main
+    with:
+      Environment: ${{inputs.Environment}}
+      SOURCE_S3_BUCKET: ${{inputs.SOURCE_S3_BUCKET}}
+    secrets: inherit

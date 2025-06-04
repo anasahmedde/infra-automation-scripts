@@ -1,0 +1,339 @@
+name: DB Upgrade Automation | CUTOVER
+run-name: ${{ inputs.JOB_NAME }} for ${{ inputs.RDS_ID }}
+on:
+    workflow_dispatch:
+        inputs:
+            Environment:
+                description: "Which environment to run the automation on"
+                required: true
+                type: choice
+                options: ['prod', 'space']
+            RDS_ID:
+              description: "The ID of RDS that you need to update (Get from input file)"
+              required: true
+              type: string
+            JOB_NAME:
+                description: 'the name of job need to be run'
+                required: false
+                default: 'cutover'
+                type: choice
+                options: ['cutover', 'stop-replication']
+    
+                
+
+env:
+    MYSQL_CLIENT_POD_NAME_PREFIX: "db-upgrade-client"
+    POD_WAIT_TIME_IN_SECONDS: 10
+    RDS_STATUS_WAIT_TIME_IN_SECONDS: 180
+
+jobs:
+    CUTOVER:
+        runs-on: [dbz-runner-amd-v2-small]
+        if: |
+            contains('["gillesvdp-dbz", "mohamedelbahr", "ETGit39", "ahmad-khan-dbz", "amrabden", "andrei-aku", "anas-dbz"]', github.actor) &&
+            github.event.inputs.JOB_NAME == 'cutover'
+        steps:
+            - name: Checkout repository 👀
+              uses: actions/checkout@v4
+              with:
+                clean: true
+            - name: Intialize Env
+              run: |
+                if [[ "${{inputs.Environment}}" == "prod" ]]; then
+                  echo "K8S_CONTEXT=arn:aws:eks:eu-west-1:847754352879:cluster/prod-eks-cluster" >> $GITHUB_ENV
+                  echo "ROLE_TO_ASSUME=arn:aws:iam::847754352879:role/CrossAccount_EKS_for_MENAOps" >> $GITHUB_ENV
+                  echo "HOST_ZONE_ID=Z34CUAVVS48LB6" >> $GITHUB_ENV
+                elif [[ "${{inputs.Environment}}" == "space" ]]; then
+                  echo "K8S_CONTEXT=arn:aws:eks:eu-west-1:857520607940:cluster/space-eks-cluster" >> $GITHUB_ENV
+                  echo "ROLE_TO_ASSUME=arn:aws:iam::857520607940:role/CrossAccount_EKS_for_MENAOps" >> $GITHUB_ENV
+                  echo "HOST_ZONE_ID=ZD2ET40NI1H0N" >> $GITHUB_ENV
+                fi
+
+                rds_identifier=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".db_identifier')
+                old_postfix=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".old_postfix')
+                new_postfix=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".new_postfix')
+                rds_secret_name=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".rds_secret_name')
+                route53_master_record=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".route53_master_record')
+                route53_replica_record=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".route53_replica_record')
+
+                if [[ -z $old_postfix || $old_postfix == '""' ]]; then
+                  echo "MAIN_RDS_IDENTIFIER=$rds_identifier" >> $GITHUB_ENV
+                else
+                  echo "MAIN_RDS_IDENTIFIER=$rds_identifier-$old_postfix" >> $GITHUB_ENV
+                fi
+                echo "NEW_RDS_IDENTIFIER=$rds_identifier-$new_postfix" >> $GITHUB_ENV
+                echo "RDS_SECRET_NAME=$rds_secret_name" >> $GITHUB_ENV
+                echo "MAIN_RECORD_NAME=$route53_master_record" >> $GITHUB_ENV
+                echo "REPLICA_RECORD_NAME=$route53_replica_record" >> $GITHUB_ENV
+
+            - name: Echo ENVs
+              run: |
+                echo "MAIN_RDS_IDENTIFIER:${{env.MAIN_RDS_IDENTIFIER}}"
+                echo "NEW_RDS_IDENTIFIER:${{env.NEW_RDS_IDENTIFIER}}"
+                echo "RDS_SECRET_NAME:${{env.RDS_SECRET_NAME}}"
+                echo "MAIN_RECORD_NAME:${{env.MAIN_RECORD_NAME}}"
+                echo "REPLICA_RECORD_NAME:${{env.REPLICA_RECORD_NAME}}"
+
+            - name: Configure AWS Credentials 🤐
+              uses: aws-actions/configure-aws-credentials@v4
+              with:
+                role-skip-session-tagging: true
+                aws-region: eu-west-1
+                role-to-assume: "${{env.ROLE_TO_ASSUME}}"
+                role-duration-seconds: 3600
+            - name: Install Kubectl
+              uses: azure/setup-kubectl@v3
+              with:
+                version: 'v1.28.0'
+            - name: Configure Kubectl
+              uses: azure/k8s-set-context@v3
+              with:
+                  method: kubeconfig
+                  kubeconfig: ${{ secrets.KUBE_CONFIG }}
+                  context: ${{ env.K8S_CONTEXT }}
+            - name: CUTOVER-PRECHECK
+              run: |
+                MYSQL_CLIENT_POD_NAME="$MYSQL_CLIENT_POD_NAME_PREFIX-${{env.MAIN_RDS_IDENTIFIER}}"
+                # Get RDS Endpoints
+                master_rds_instance_endpoint=$( aws rds describe-db-instances --db-instance-identifier ${{ env.MAIN_RDS_IDENTIFIER }} | jq -r '.DBInstances[0].Endpoint.Address')
+                new_rds_instance_endpoint=$( aws rds describe-db-instances --db-instance-identifier ${{ env.NEW_RDS_IDENTIFIER }} | jq -r '.DBInstances[0].Endpoint.Address')
+                # Get Master RDS Credentials
+                rds_username=$( aws secretsmanager get-secret-value --secret-id db-upgrade-secrets/${{ env.RDS_SECRET_NAME }} | jq -r '.SecretString| fromjson' | jq -r '.username' )
+                rds_password=$( aws secretsmanager get-secret-value --secret-id db-upgrade-secrets/${{ env.RDS_SECRET_NAME }} | jq -r '.SecretString| fromjson' | jq -r '.password' )
+
+                # Create MySQL Client Pod
+                pod_exist=$(kubectl get pods -n infra | grep $MYSQL_CLIENT_POD_NAME | { grep -v grep || true; } )
+                if [[ -z "$pod_exist" ]]; then
+                    kubectl run -n infra $MYSQL_CLIENT_POD_NAME --image=mysql --restart=Never --env=MYSQL_ALLOW_EMPTY_PASSWORD=true
+                    sleep $POD_WAIT_TIME_IN_SECONDS
+                fi
+
+                # Get Write Operations on Master RDS
+                kubectl exec -n infra -it $MYSQL_CLIENT_POD_NAME -- mysql --host="$master_rds_instance_endpoint" --user=$rds_username --password=$rds_password --execute="SHOW FULL PROCESSLIST\G;" > master_rds_process_list.txt
+                echo "Process List"
+                echo "------------------"
+                cat master_rds_process_list.txt
+                echo "========================================================================"
+                check_insert_statement=$(cat master_rds_process_list.txt | grep -i insert | { grep -v grep || true; })
+                check_update_statement=$(cat master_rds_process_list.txt | grep -iw update | { grep -v grep || true; })
+                check_delete_statement=$(cat master_rds_process_list.txt | grep -iw delete | { grep -v grep || true; })
+
+                COUNTER=0
+                while [  $COUNTER -lt 4 ]; do
+                    echo "Check For Insert Statement: $check_insert_statement"
+                    echo "Check For Update Statement: $check_update_statement"
+                    echo "Check For Delete Statement: $check_delete_statement"
+
+                    if [[ -z "$check_insert_statement" && -z "$check_update_statement" && -z "$check_delete_statement" ]]; then
+                        break
+                    else
+                        echo "Master RDS has some write operations ... Sleep for 10 seconds and check again" 
+                        sleep 10
+                        
+                        # Get Write Operations on Master RDS
+                        kubectl exec -n infra -it $MYSQL_CLIENT_POD_NAME -- mysql --host="$master_rds_instance_endpoint" --user=$rds_username --password=$rds_password --execute="SHOW FULL PROCESSLIST\G;" > master_rds_process_list.txt
+                        echo "Process List"
+                        echo "------------------"
+                        cat master_rds_process_list.txt
+                        echo "========================================================================"
+                        check_insert_statement=$(cat master_rds_process_list.txt | grep -i insert | { grep -v grep || true; })
+                        check_update_statement=$(cat master_rds_process_list.txt | grep -iw update | { grep -v grep || true; })
+                        check_delete_statement=$(cat master_rds_process_list.txt | grep -iw delete | { grep -v grep || true; })
+                    fi
+                
+                    let COUNTER=$COUNTER+1 
+                done
+
+                # Stop writing on Main RDS
+                echo "Stop writing on current RDS..."
+                master_rds_parameter_group=$( aws rds describe-db-instances --db-instance-identifier ${{ env.MAIN_RDS_IDENTIFIER }} | jq -r '.DBInstances[0].DBParameterGroups[0].DBParameterGroupName')
+                disable_write_operations_exec_command=$(aws rds modify-db-parameter-group \
+                                --db-parameter-group-name $master_rds_parameter_group \
+                                --parameters "ParameterName='read_only',ParameterValue='1',ApplyMethod=immediate")
+                sleep 15s
+                
+
+                # Get Slave Status
+                kubectl exec -n infra -it $MYSQL_CLIENT_POD_NAME -- mysql --host="$new_rds_instance_endpoint" --user=$rds_username --password=$rds_password --execute="show replica status\G;" > replica_status_output.txt
+                seconds_behind_source_rds=$(cat replica_status_output.txt | grep Seconds_Behind_Source | awk '{print $2}')
+                echo "Seconds_Behind_Source: $seconds_behind_source_rds"
+                while [  "$seconds_behind_source_rds" != "0" ]; do
+                    echo "Seconds_Behind_Source: $seconds_behind_source_rds"
+                    echo "Replica not synced yet with Master ... Sleep for 10 seconds and check again" 
+                    sleep 10
+                    kubectl exec -n infra -it $MYSQL_CLIENT_POD_NAME -- mysql --host="$new_rds_instance_endpoint" --user=$rds_username --password=$rds_password --execute="show replica status\G;" > replica_status_output.txt
+                    seconds_behind_source_rds=$(cat replica_status_output.txt | grep Seconds_Behind_Source | awk '{print $2}')
+                done
+                
+                kubectl delete -n infra pod/$MYSQL_CLIENT_POD_NAME
+            - name: CUTOVER
+              if: env.MAIN_RECORD_NAME != ''
+              run: |
+                # Check for Replicas Count
+                current_replicas_count=$(aws rds describe-db-instances --db-instance-identifier  ${{ env.NEW_RDS_IDENTIFIER }} | jq -r '.DBInstances[0].ReadReplicaDBInstanceIdentifiers[]' | wc -l)
+                echo "Number of replicas for current RDS: $current_replicas_count"
+
+                if [[ $current_replicas_count -gt 0 && "${{ env.REPLICA_RECORD_NAME}}" == "" ]]; then
+                    echo "You should provide replica record name to be updated"
+                    exit 1
+                fi
+
+                # Update Main Record Value
+                echo "Updating Value in Master Record to point to new Master RDS..."
+                main_record_new_value=$(aws rds describe-db-instances --db-instance-identifier ${{ env.NEW_RDS_IDENTIFIER }} | jq -r '.DBInstances[0].Endpoint.Address')
+                record_set_change_json=$( jq -n \
+                                --arg record_name "${{ env.MAIN_RECORD_NAME }}" \
+                                --arg rds_new_endpoint "$main_record_new_value" \
+                                '{ "Comment":"Updates CNAME to a specified value", "Changes":[{ "Action":"UPSERT", "ResourceRecordSet":{ "Name":$record_name, "Type":"CNAME", "TTL":30, "ResourceRecords":[{"Value":$rds_new_endpoint}]}}]}' \
+                            )
+                echo $record_set_change_json > update-rds-record-${{env.MAIN_RDS_IDENTIFIER}}.json
+                aws route53 change-resource-record-sets --hosted-zone-id  ${{ env.HOST_ZONE_ID }} --change-batch file://update-rds-record-${{env.MAIN_RDS_IDENTIFIER}}.json
+                echo "Master RDS Record has been updated successfully"
+
+                # Handle Replica Record
+                if [ $current_replicas_count -gt 0 ]; then
+                    count_of_replica_records=$(aws route53 list-resource-record-sets --hosted-zone-id ${{ env.HOST_ZONE_ID }} --query "ResourceRecordSets[?Name == '"${{ env.REPLICA_RECORD_NAME }}".']" | jq -r '.[].Name' | wc -l)
+                    echo "Number of relpica record_sets: $count_of_replica_records"
+                    # Validate if rds replicas count is equal to number of records in Route53;
+                    if [ $current_replicas_count -ne $count_of_replica_records ]; then
+                        echo "Replica Route is having recored more than number of replicas available; Replica DNS updating should be manually"
+                        exit 1
+                    fi
+
+                    if [ $current_replicas_count -gt 1 ]; then
+                        echo "Case of multiple replica still not supported, you should update replica route manually"
+                        exit 1
+                    fi
+
+                    # Update Replica Record Value
+                    echo "Updating Value in Replica Record to point to new Replica RDS..."
+                    first_replica=$(aws rds describe-db-instances --db-instance-identifier ${{ env.NEW_RDS_IDENTIFIER }} | jq -r '.DBInstances[0].ReadReplicaDBInstanceIdentifiers[0]')
+                    # Get Replica Endpoint
+                    replica_record_new_value=$(aws rds describe-db-instances --db-instance-identifier $first_replica | jq -r '.DBInstances[0].Endpoint.Address')
+                    record_set_change_json=$( jq -n \
+                                    --arg record_name "${{ env.REPLICA_RECORD_NAME }}" \
+                                    --arg rds_new_endpoint "$replica_record_new_value" \
+                                    '{ "Comment":"Updates CNAME to a specified value", "Changes":[{ "Action":"UPSERT", "ResourceRecordSet":{ "Name":$record_name, "Type":"CNAME", "TTL":30, "ResourceRecords":[{"Value":$rds_new_endpoint}]}}]}' \
+                                )
+                    echo $record_set_change_json > update-rds-record-$first_replica.json
+                    aws route53 change-resource-record-sets --hosted-zone-id  ${{ env.HOST_ZONE_ID }} --change-batch file://update-rds-record-$first_replica.json
+                    echo "Replica RDS Record has been updated successfully"
+                fi
+
+            - name: Print Message if required input not provided
+              if: env.MAIN_RECORD_NAME == ''
+              run: |
+                echo "Please provide HOST_ZONE_ID and MAIN_RECORD_NAME values for cutover"
+                exit 0
+
+    STOP-REPLICATION:
+        runs-on: [dbz-runner-amd-v2-small]
+        if: |
+            contains('["gillesvdp-dbz", "mohamedelbahr", "ETGit39", "ahmad-khan-dbz", "amrabden", "andrei-aku", "anas-dbz"]', github.actor) &&
+            github.event.inputs.JOB_NAME == 'stop-replication'
+        steps:
+            - name: Checkout repository 👀
+              uses: actions/checkout@v4
+              with:
+                clean: true
+            - name: Intialize Env
+              run: |
+                if [[ "${{inputs.Environment}}" == "prod" ]]; then
+                  echo "K8S_CONTEXT=arn:aws:eks:eu-west-1:847754352879:cluster/prod-eks-cluster" >> $GITHUB_ENV
+                  echo "ROLE_TO_ASSUME=arn:aws:iam::847754352879:role/CrossAccount_EKS_for_MENAOps" >> $GITHUB_ENV
+                  echo "HOST_ZONE_ID=Z34CUAVVS48LB6" >> $GITHUB_ENV
+                elif [[ "${{inputs.Environment}}" == "space" ]]; then
+                  echo "K8S_CONTEXT=arn:aws:eks:eu-west-1:857520607940:cluster/space-eks-cluster" >> $GITHUB_ENV
+                  echo "ROLE_TO_ASSUME=arn:aws:iam::857520607940:role/CrossAccount_EKS_for_MENAOps" >> $GITHUB_ENV
+                  echo "HOST_ZONE_ID=ZD2ET40NI1H0N" >> $GITHUB_ENV
+                fi
+
+                rds_identifier=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".db_identifier')
+                old_postfix=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".old_postfix')
+                new_postfix=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".new_postfix')
+                rds_secret_name=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".rds_secret_name')
+                route53_master_record=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".route53_master_record')
+                route53_replica_record=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".route53_replica_record')
+
+                if [[ -z $old_postfix || $old_postfix == '""' ]]; then
+                  echo "MAIN_RDS_IDENTIFIER=$rds_identifier" >> $GITHUB_ENV
+                else
+                  echo "MAIN_RDS_IDENTIFIER=$rds_identifier-$old_postfix" >> $GITHUB_ENV
+                fi
+                echo "NEW_RDS_IDENTIFIER=$rds_identifier-$new_postfix" >> $GITHUB_ENV
+                echo "RDS_SECRET_NAME=$rds_secret_name" >> $GITHUB_ENV
+                echo "MAIN_RECORD_NAME=$route53_master_record" >> $GITHUB_ENV
+                echo "REPLICA_RECORD_NAME=$route53_replica_record" >> $GITHUB_ENV
+
+            - name: Echo ENVs
+              run: |
+                echo "MAIN_RDS_IDENTIFIER:${{env.MAIN_RDS_IDENTIFIER}}"
+                echo "NEW_RDS_IDENTIFIER:${{env.NEW_RDS_IDENTIFIER}}"
+                echo "RDS_SECRET_NAME:${{env.RDS_SECRET_NAME}}"
+                echo "MAIN_RECORD_NAME:${{env.MAIN_RECORD_NAME}}"
+                echo "REPLICA_RECORD_NAME:${{env.REPLICA_RECORD_NAME}}"
+
+            - name: Configure AWS Credentials 🤐
+              uses: aws-actions/configure-aws-credentials@v4
+              with:
+                role-skip-session-tagging: true
+                aws-region: eu-west-1
+                role-to-assume: "${{env.ROLE_TO_ASSUME}}"
+                role-duration-seconds: 3600
+            - name: Install Kubectl
+              uses: azure/setup-kubectl@v3
+              with:
+                version: 'v1.28.0'
+            - name: Configure Kubectl
+              uses: azure/k8s-set-context@v3
+              with:
+                    method: kubeconfig
+                    kubeconfig: ${{ secrets.KUBE_CONFIG }}
+                    context: ${{ env.K8S_CONTEXT }}
+            - name: Stop Replication
+              if: env.MAIN_RECORD_NAME != ''
+              run: |
+                # Stop Replication
+                MYSQL_CLIENT_POD_NAME="$MYSQL_CLIENT_POD_NAME_PREFIX-${{env.MAIN_RDS_IDENTIFIER}}"
+                # Create MySQL Client Pod
+                pod_exist=$(kubectl get pods -n infra | grep $MYSQL_CLIENT_POD_NAME | { grep -v grep || true; } )
+                if [[ -z "$pod_exist" ]]; then
+                    kubectl run -n infra $MYSQL_CLIENT_POD_NAME --image=mysql --restart=Never --env=MYSQL_ALLOW_EMPTY_PASSWORD=true
+                    sleep $POD_WAIT_TIME_IN_SECONDS
+                fi
+
+                # Get RDS Endpoints
+                new_rds_instance_endpoint=$( aws rds describe-db-instances --db-instance-identifier ${{ env.NEW_RDS_IDENTIFIER }} | jq -r '.DBInstances[0].Endpoint.Address')
+                # Get Master RDS Credentials
+                rds_username=$( aws secretsmanager get-secret-value --secret-id db-upgrade-secrets/${{ env.RDS_SECRET_NAME }} | jq -r '.SecretString| fromjson' | jq -r '.username' )
+                rds_password=$( aws secretsmanager get-secret-value --secret-id db-upgrade-secrets/${{ env.RDS_SECRET_NAME }} | jq -r '.SecretString| fromjson' | jq -r '.password' )
+
+                kubectl exec -n infra -it $MYSQL_CLIENT_POD_NAME -- mysql --host="$new_rds_instance_endpoint" --user=$rds_username --password=$rds_password --execute="show replica status\G;"
+                kubectl exec -n infra -it $MYSQL_CLIENT_POD_NAME -- mysql --host="$new_rds_instance_endpoint" --user=$rds_username --password=$rds_password --execute="CALL mysql.rds_stop_replication;"
+                kubectl exec -n infra -it $MYSQL_CLIENT_POD_NAME -- mysql --host="$new_rds_instance_endpoint" --user=$rds_username --password=$rds_password --execute="CALL mysql.rds_reset_external_master;"
+                
+                kubectl delete -n infra pod/$MYSQL_CLIENT_POD_NAME
+
+                # Updating TTL to 300 seconds
+                echo "Updating TTL to 300 seconds in Master Record..."
+                main_record_current_value=$(aws route53 list-resource-record-sets --hosted-zone-id ${{ env.HOST_ZONE_ID }} --query "ResourceRecordSets[?Name == '"${{ env.MAIN_RECORD_NAME }}".']" | jq -r '.[0].ResourceRecords[].Value')
+                record_set_change_json=$( jq -n \
+                                --arg record_name "${{ env.MAIN_RECORD_NAME }}" \
+                                --arg rds_current_endpoint "$main_record_current_value" \
+                                '{ "Comment":"Updates TTL to a 300", "Changes":[{ "Action":"UPSERT", "ResourceRecordSet":{ "Name":$record_name, "Type":"CNAME", "TTL":300, "ResourceRecords":[{"Value":$rds_current_endpoint}]}}]}' \
+                            )
+                echo $record_set_change_json > update-rds-record-${{env.NEW_RDS_IDENTIFIER}}.json
+                aws route53 change-resource-record-sets --hosted-zone-id  ${{ env.HOST_ZONE_ID }} --change-batch file://update-rds-record-${{env.NEW_RDS_IDENTIFIER}}.json
+
+                echo "Updating TTL to 300 seconds in Replica Record..."
+                if [[ "${{ env.REPLICA_RECORD_NAME}}" != "" ]]; then
+                    replica_record_current_value=$(aws route53 list-resource-record-sets --hosted-zone-id ${{ env.HOST_ZONE_ID }} --query "ResourceRecordSets[?Name == '"${{ env.REPLICA_RECORD_NAME }}".']" | jq -r '.[0].ResourceRecords[].Value')
+                    record_set_change_json=$( jq -n \
+                                    --arg record_name "${{ env.REPLICA_RECORD_NAME }}" \
+                                    --arg rds_current_endpoint "$replica_record_current_value" \
+                                    '{ "Comment":"Updates TTL to a 300", "Changes":[{ "Action":"UPSERT", "ResourceRecordSet":{ "Name":$record_name, "Type":"CNAME", "TTL":300, "ResourceRecords":[{"Value":$rds_current_endpoint}]}}]}' \
+                                )
+                    echo $record_set_change_json > update-rds-record-${{env.NEW_RDS_IDENTIFIER}}.json
+                    aws route53 change-resource-record-sets --hosted-zone-id  ${{ env.HOST_ZONE_ID }} --change-batch file://update-rds-record-${{env.NEW_RDS_IDENTIFIER}}.json
+                fi
+                

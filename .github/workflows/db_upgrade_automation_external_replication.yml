@@ -1,0 +1,199 @@
+name: DB Upgrade Automation | ENABLE-EXTERNAL-REPLICATION
+run-name: ENABLE-EXTERNAL-REPLICATION for ${{ inputs.RDS_ID }}
+on:
+    workflow_dispatch:
+        inputs:
+            Environment:
+                description: "Which environment to run the automation on"
+                required: true
+                type: choice
+                options: ['prod', 'space']
+            RDS_ID:
+              description: "The ID of RDS that you need to update (Get from input file)"
+              required: true
+              type: string
+            RELAY_SOURCE_LOG_FILE:
+                description: The relay log file of the master rds to use in the external replication
+                required: true
+                type: string
+            EXEC_SOURCE_LOG_POS:
+                description: The position of log file of the master rds to use in the external replication
+                required: true
+                type: string
+    workflow_call:
+        inputs:
+            Environment:
+              description: "Which environment to run the automation on"
+              required: true
+              type: string
+            RDS_ID:
+              description: "The ID of RDS that you need to update (Get from input file)"
+              required: true
+              type: string
+            RELAY_SOURCE_LOG_FILE:
+              description: The relay log file of the master rds to use in the external replication
+              required: true
+              type: string
+            EXEC_SOURCE_LOG_POS:
+              description: The position of log file of the master rds to use in the external replication
+              required: true
+              type: string
+
+env:
+    MYSQL_CLIENT_POD_NAME_PREFIX: "db-upgrade-client"
+    POD_WAIT_TIME_IN_SECONDS: 10
+    RDS_STATUS_WAIT_TIME_IN_SECONDS: 180
+
+jobs:
+    ENABLE-EXTERNAL-REPLICATION:
+        runs-on: [dbz-runner-amd-v2-small]
+        if: contains('["gillesvdp-dbz", "mohamedelbahr", "ETGit39", "ahmad-khan-dbz", "amrabden", "andrei-aku", "anas-dbz"]', github.actor)
+        steps:
+            - name: Checkout repository 👀
+              uses: actions/checkout@v4
+              with:
+                clean: true
+            - name: Intialize Env
+              run: |
+                if [[ "${{inputs.Environment}}" == "prod" ]]; then
+                  echo "K8S_CONTEXT=arn:aws:eks:eu-west-1:847754352879:cluster/prod-eks-cluster" >> $GITHUB_ENV
+                  echo "ROLE_TO_ASSUME=arn:aws:iam::847754352879:role/CrossAccount_EKS_for_MENAOps" >> $GITHUB_ENV
+                elif [[ "${{inputs.Environment}}" == "space" ]]; then
+                  echo "K8S_CONTEXT=arn:aws:eks:eu-west-1:857520607940:cluster/space-eks-cluster" >> $GITHUB_ENV
+                  echo "ROLE_TO_ASSUME=arn:aws:iam::857520607940:role/CrossAccount_EKS_for_MENAOps" >> $GITHUB_ENV
+                fi
+
+                rds_identifier=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".db_identifier')
+                old_postfix=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".old_postfix')
+                new_postfix=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".new_postfix')
+                rds_secret_name=$(cat db_upgrade_inputfiles/db_upgrade_inputfile.json | jq '."${{inputs.RDS_ID}}".rds_secret_name')
+
+                if [[ -z $old_postfix || $old_postfix == '""' ]]; then
+                  echo "MAIN_RDS_IDENTIFIER=$rds_identifier" >> $GITHUB_ENV
+                else
+                  echo "MAIN_RDS_IDENTIFIER=$rds_identifier-$old_postfix" >> $GITHUB_ENV
+                fi
+                echo "NEW_RDS_IDENTIFIER=$rds_identifier-$new_postfix" >> $GITHUB_ENV
+                echo "NEW_PARAMETER_GROUP=$rds_identifier-$new_postfix-pg" >> $GITHUB_ENV
+                echo "RDS_SECRET_NAME=$rds_secret_name" >> $GITHUB_ENV
+
+            - name: Echo ENVs
+              run: |
+                echo "MAIN_RDS_IDENTIFIER:${{env.MAIN_RDS_IDENTIFIER}}"
+                echo "NEW_RDS_IDENTIFIER:${{env.NEW_RDS_IDENTIFIER}}"
+                echo "NEW_PARAMETER_GROUP:${{env.NEW_PARAMETER_GROUP}}"
+                echo "RDS_SECRET_NAME:${{env.RDS_SECRET_NAME}}"
+                echo "RELAY_SOURCE_LOG_FILE:${{inputs.RELAY_SOURCE_LOG_FILE}}"
+                echo "EXEC_SOURCE_LOG_POS:${{inputs.EXEC_SOURCE_LOG_POS}}"
+
+            - name: Configure AWS Credentials 🤐
+              uses: aws-actions/configure-aws-credentials@v4
+              with:
+                role-skip-session-tagging: true
+                aws-region: eu-west-1
+                role-to-assume: "${{env.ROLE_TO_ASSUME}}"
+                role-duration-seconds: 3600
+            - name: Install Kubectl
+              uses: azure/setup-kubectl@v3
+              with:
+                version: 'v1.28.0'
+            - name: Configure Kubectl
+              uses: azure/k8s-set-context@v3
+              with:
+                method: kubeconfig
+                kubeconfig: ${{ secrets.KUBE_CONFIG }}
+                context: ${{ env.K8S_CONTEXT }}
+            - name: Enable External Replication
+              run: |
+                MYSQL_CLIENT_POD_NAME="$MYSQL_CLIENT_POD_NAME_PREFIX-${{env.MAIN_RDS_IDENTIFIER}}"
+                relay_source_log_file="${{inputs.RELAY_SOURCE_LOG_FILE}}"
+                exec_source_log_pos=${{inputs.EXEC_SOURCE_LOG_POS}}
+                
+
+                # Get Master and new RDS Endpoint
+                master_rds_instance_endpoint=$( aws rds describe-db-instances --db-instance-identifier ${{ env.MAIN_RDS_IDENTIFIER }} | jq -r '.DBInstances[0].Endpoint.Address')
+                new_rds_instance_endpoint=$( aws rds describe-db-instances --db-instance-identifier ${{ env.NEW_RDS_IDENTIFIER }} | jq -r '.DBInstances[0].Endpoint.Address')
+                db_port=3306
+
+                # Get Master RDS Credentials
+                rds_username=$( aws secretsmanager get-secret-value --secret-id db-upgrade-secrets/${{ env.RDS_SECRET_NAME }} | jq -r '.SecretString| fromjson' | jq -r '.username' )
+                rds_password=$( aws secretsmanager get-secret-value --secret-id db-upgrade-secrets/${{ env.RDS_SECRET_NAME }} | jq -r '.SecretString| fromjson' | jq -r '.password' )
+
+                # Create mysql client pod on the cluster
+                pod_exist=$(kubectl get pods -n infra | grep $MYSQL_CLIENT_POD_NAME | { grep -v grep || true; } )
+                if [[ -z "$pod_exist" ]]; then
+                    kubectl run -n infra $MYSQL_CLIENT_POD_NAME --image=mysql --restart=Never --env=MYSQL_ALLOW_EMPTY_PASSWORD=true
+                    sleep $POD_WAIT_TIME_IN_SECONDS
+                fi
+
+                # Create a new user for replication
+                echo "Create a new user for replication..."
+                replication_username='replicator_user'
+                replication_password=$(echo ${rds_password:0:32})
+
+                kubectl exec -n infra -it $MYSQL_CLIENT_POD_NAME -- mysql --host="$master_rds_instance_endpoint" --user=$rds_username --password=$rds_password --execute="CREATE USER '"$replication_username"'@'%' IDENTIFIED WITH mysql_native_password BY '"$replication_password"';" || true
+                kubectl exec -n infra -it $MYSQL_CLIENT_POD_NAME -- mysql --host="$master_rds_instance_endpoint" --user=$rds_username --password=$rds_password --execute="GRANT REPLICATION SLAVE ON *.* TO '"$replication_username"'@'%';" || true
+
+
+                # Create a new Paramter Group
+                new_rds_current_pg=$(aws rds describe-db-instances --db-instance-identifier ${{ env.NEW_RDS_IDENTIFIER }} | jq -r '.DBInstances[0].DBParameterGroups[0].DBParameterGroupName')
+
+                new_rds_new_pg_identifier=${{env.NEW_PARAMETER_GROUP}}
+                echo $new_rds_new_pg_identifier
+                echo "Creating new parameter group for the new rds..."
+                create_new_pg=$(aws rds copy-db-parameter-group \
+                                --source-db-parameter-group-identifier $new_rds_current_pg\
+                                --target-db-parameter-group-identifier $new_rds_new_pg_identifier \
+                                --target-db-parameter-group-description "Copy of $new_rds_current_pg to upgrade engine version")
+                update_new_pg=$(aws rds modify-db-parameter-group \
+                                --db-parameter-group-name $new_rds_new_pg_identifier \
+                                --parameters "ParameterName='autocommit',ParameterValue='1',ApplyMethod=immediate")
+                echo "Updating the paramter group of the new rds..."
+                update_rds_pg=$(aws rds modify-db-instance \
+                                --db-instance-identifier ${{ env.NEW_RDS_IDENTIFIER }} \
+                                --db-parameter-group-name $new_rds_new_pg_identifier \
+                                --apply-immediately \
+                                --region eu-west-1)
+                
+                # Intial sleep before getting status as it delays around 1 minute before starting promotion
+                sleep $RDS_STATUS_WAIT_TIME_IN_SECONDS
+                new_rds_status=$(aws rds describe-db-instances --db-instance-identifier ${{ env.NEW_RDS_IDENTIFIER }} | jq -r '.DBInstances[0].DBInstanceStatus')
+                while [ $new_rds_status != "available" ]
+                do
+                    echo "New RDS Status: $new_rds_status"
+                    echo "New rds replica is still not available"
+                    sleep $RDS_STATUS_WAIT_TIME_IN_SECONDS
+                    new_rds_status=$(aws rds describe-db-instances --db-instance-identifier ${{ env.NEW_RDS_IDENTIFIER }} | jq -r '.DBInstances[0].DBInstanceStatus')
+                done
+
+                # Handle case of pending reboot
+                new_rds_current_pg_status=$(aws rds describe-db-instances --db-instance-identifier ${{ env.NEW_RDS_IDENTIFIER }} | jq -r '.DBInstances[0].DBParameterGroups[0].ParameterApplyStatus')
+                if [ "$new_rds_current_pg_status" == "pending-reboot" ]; then
+                    echo "Reboot the new rds to reflect parameter group update..."
+                    aws rds reboot-db-instance --db-instance-identifier ${{ env.NEW_RDS_IDENTIFIER }}
+                    sleep 10
+                    new_rds_status=$(aws rds describe-db-instances --db-instance-identifier ${{ env.NEW_RDS_IDENTIFIER }} | jq -r '.DBInstances[0].DBInstanceStatus')
+                    while [ $new_rds_status != "available" ]
+                    do
+                        echo "New RDS Status: $new_rds_status"
+                        echo "New rds replica is still not available"
+                        sleep $RDS_STATUS_WAIT_TIME_IN_SECONDS
+                        new_rds_status=$(aws rds describe-db-instances --db-instance-identifier ${{ env.NEW_RDS_IDENTIFIER }} | jq -r '.DBInstances[0].DBInstanceStatus')
+                    done
+                fi
+                
+
+                # Start External Replication
+                
+                echo $'Starting external Replication ...'
+                kubectl exec -n infra -it $MYSQL_CLIENT_POD_NAME -- mysql --host="$new_rds_instance_endpoint" --user=$rds_username --password=$rds_password --execute="CALL mysql.rds_set_external_master('"$master_rds_instance_endpoint"', $db_port, '"$replication_username"', '"$replication_password"','"$relay_source_log_file"', $exec_source_log_pos, 1);"
+
+                kubectl exec -n infra -it $MYSQL_CLIENT_POD_NAME -- mysql --host="$new_rds_instance_endpoint" --user=$rds_username --password=$rds_password --execute="CALL mysql.rds_start_replication;"
+                echo $'External Replication Started'
+                kubectl exec -n infra -it $MYSQL_CLIENT_POD_NAME -- mysql --host="$new_rds_instance_endpoint" --user=$rds_username --password=$rds_password --execute="show replica status\G;"
+
+                # Validate Permissions of the application user
+                kubectl exec -n infra -it $MYSQL_CLIENT_POD_NAME -- mysql --host="$new_rds_instance_endpoint" --user=$rds_username --password=$rds_password --execute="grant SYSTEM_VARIABLES_ADMIN on *.* to $rds_username;" || true
+                kubectl exec -n infra -it $MYSQL_CLIENT_POD_NAME -- mysql --host="$new_rds_instance_endpoint" --user=$rds_username --password=$rds_password --execute="grant SESSION_VARIABLES_ADMIN on *.* to $rds_username;" || true
+                
+                kubectl delete -n infra pod/$MYSQL_CLIENT_POD_NAME

@@ -1,0 +1,59 @@
+name: Check Prod Blue Cluster Running
+
+on:
+    workflow_dispatch:
+
+    schedule:
+      - cron: "00 18 * * *"      #10PM
+
+jobs:
+
+    check-prod-blue:
+        runs-on: [dbz-infra-runner-amd-v2]
+        steps:
+
+        - name: Clean Container 📦🧹
+          uses: dbz/actions-clean@v2
+
+        - name: Checkout repository 👀
+          uses: actions/checkout@v3
+ 
+        - name: Configure AWS Credentials
+          uses: aws-actions/configure-aws-credentials@v4
+          with:
+            role-skip-session-tagging: true
+            aws-region: eu-west-1
+            role-to-assume: arn:aws:iam::847754352879:role/CrossAccount_EKS_for_MENAOps
+            role-duration-seconds: 1800
+
+        - name: Install Kubectl
+          uses: azure/setup-kubectl@v3
+          with:
+            version: 'v1.28.0'
+
+        - name: Configure Kubectl
+          uses: azure/k8s-set-context@v3
+          with:
+            method: kubeconfig
+            kubeconfig: ${{ secrets.KUBE_CONFIG }}
+            context: arn:aws:eks:eu-west-1:847754352879:cluster/prod-blue-eks-cluster
+
+        - name: Check prod blue existing nodes
+          run: |
+            NUMBER_OF_NODES=$(kubectl get nodes --no-headers | wc -l)
+            echo "NUMBER_OF_NODES=$NUMBER_OF_NODES" >> $GITHUB_ENV
+            echo "Number of nodes is ${NUMBER_OF_NODES}"
+            if [ $NUMBER_OF_NODES -eq 0 ]; then
+              echo "Prod blue cluster is scaled down ✅"
+            else
+              echo "Prod blue cluster is not scaled down ❗❗"
+            fi
+
+        - name: Bot Activity Slack Notification
+          if: ${{ env.NUMBER_OF_NODES != 0 }}
+          uses: slackapi/slack-github-action@v1.25.0
+          with:
+            channel-id: C0255RU1ATZ
+            slack-message: "@here Please check prod blue cluster is up for today ⚠️⚠️"
+          env:
+            SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}

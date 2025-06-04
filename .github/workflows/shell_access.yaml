@@ -1,0 +1,245 @@
+name: Shell Access
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: 'Select an environment to run manual shell on'
+        required: false
+        type: string
+        default: 'dev-space'
+      service_name:
+        description: 'Which service do you want to use?'
+        required: true
+        type: string
+      migration_shell:
+        description: 'Do you want to use a migration shell?'
+        required: true
+        type: string
+      input:
+        description: 'Please enter the python management command'
+        required: true
+        type: string
+      justification:
+        description: 'Justification (reason for running the command)'
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Select an environment to run manual shell on'
+        required: true
+        type: choice
+        options: ['dev-space', 'prod']
+        default: 'dev-space'
+      service_name:
+        description: 'Which service do you want to use?'
+        required: true
+        type: choice
+        options: ['ats-frontend','ats','authenticator','bigluu','calltracking','chat-service','codi','content-first-service','engineering-metrics','favorites-service','frontend-web-listings','frontend-web-place-an-ad','frontend-web-seller','fuloos','greedy','horizontal-buyer-service','image-upload-service','kombi','location-service','monolith','notification-scheduler','pegasus','property-lpv-service','seller-service','servicedex','sitemaps-indexer','tx-service']
+      migration_shell:
+        description: 'Do you want to use a migration shell?'
+        required: true
+        type: choice
+        default: 'false'
+        options: ['true', 'false']
+      input:
+        description: 'Please enter the django management command'
+        required: true
+        type: string
+      justification:
+        description: 'Justification (reason for running the command)'
+        required: true
+        type: string
+
+jobs:
+  RUN-MANUAL-SHELL:
+    runs-on: [dbz-infra-runner-amd-v2]
+    # use the below runner only to test anything on space easily
+    # runs-on: [self-hosted, dbz-runner-amd-v2-small]
+    steps:
+
+      - name: Verify Command 👁️‍🗨️
+        run:  |
+          if [[ "${{ inputs.input }}" == *"&&"* || "${{ inputs.input }}" == *";"* || "${{ inputs.input }}" == *"<"* ]]; then
+            echo "Stop 🛑, the string contains '&&' or ';' or "<"."
+            exit 50
+          fi
+
+      - name: Checkout repository 👀
+        uses: actions/checkout@v4
+        with:
+          clean: true
+
+      - name: Clean SSH key 🧹🔑
+        uses: JesseTG/rm@v1.0.2
+        with:
+          path: /home/ec2-user/.ssh/id_rsa
+
+      - name: Install SSH key 🔐
+        uses: shimataro/ssh-key-action@v2.6.1
+        with:
+          key: ${{ secrets.SSH_KEY }}
+          name: id_rsa
+          known_hosts: ${{ secrets.KNOWN_HOSTS }}
+
+      - name: Clone Infra-Automation 👷🏼‍♂️
+        if: ${{ inputs.environment == 'prod' }}
+        run: |
+          git clone -b main git@github.com:dbz/infra-automation.git
+
+      - name: Initialize Logging Variables 🤖
+        if: ${{ inputs.environment == 'prod' }}
+        run: |
+          event_payload=$(cat $GITHUB_EVENT_PATH)
+          inputs_string=$(echo "$event_payload" | jq -r '.inputs | to_entries | map("\(.key)=\(.value|tostring)") | join(",")')
+          echo "INPUT_PARAMETERS=$inputs_string" >> $GITHUB_ENV
+          echo "USER=${{ github.actor }}" >> $GITHUB_ENV
+          echo "SERVICE_NAME=${{ inputs.service_name }}" >> $GITHUB_ENV
+          echo "WORKFLOW_EXECUTED=${{ github.workflow }}" >> $GITHUB_ENV
+          echo "LINK_TO_EXECUTION=https://github.com/${{ github.repository }}/actions/runs/${GITHUB_RUN_ID}" >> $GITHUB_ENV
+          echo "MESSAGE=${{ github.actor }} is going to run the management command "${{ inputs.input }}" for service ${{ inputs.service_name}}" >> $GITHUB_ENV
+
+      - name: Send request to OpenSearch 📤
+        if: ${{ inputs.environment == 'prod' }}
+        run: |
+          bash infra-automation/elk_logging/send_logs_to_elk.sh
+
+      - name: Set Variables 🏵️
+        run: |
+          environment=${{ inputs.environment }}
+          echo "environment=$environment" >> $GITHUB_ENV
+          echo $environment
+
+          service_name=${{ inputs.service_name }}
+          echo "service_name=$service_name" >> $GITHUB_ENV
+          echo $service_name
+
+          user=${{ github.actor }}
+          user=$(echo "$user" | tr '[:upper:]' '[:lower:]')
+          echo "user=$user" >> $GITHUB_ENV
+          echo $user
+
+          command='${{ inputs.input }}'
+          echo "command=$command" >> $GITHUB_ENV
+          echo $command
+
+          # Check for migration shell
+          if [ "${{ inputs.migration_shell }}" == "true" ]; then
+            cronjob_name=${{ inputs.service_name }}-migration-shell-executor
+            echo "cronjob_name=$cronjob_name" >> $GITHUB_ENV
+            echo $cronjob_name
+          elif [ "${{ inputs.migration_shell }}" == "false" ]; then
+            cronjob_name=${{ inputs.service_name }}-shell-executor
+            echo "cronjob_name=$cronjob_name" >> $GITHUB_ENV
+            echo $cronjob_name
+          fi
+
+      - name: Intialize Environment Specific Variables 🪴
+        run: |
+          if [[ "${{ env.environment }}" == "prod" ]]; then
+            echo "K8S_CONTEXT=arn:aws:eks:eu-west-1:847754352879:cluster/prod-eks-cluster" >> $GITHUB_ENV
+            echo "ROLE_TO_ASSUME=arn:aws:iam::847754352879:role/CrossAccount_EKS_for_MENAOps" >> $GITHUB_ENV
+          elif [[ "${{ env.environment }}" == "dev-space" ]]; then
+            echo "ROLE_TO_ASSUME=arn:aws:iam::857520607940:role/CrossAccount_EKS_for_MENAOps" >> $GITHUB_ENV
+            echo "Service is in dev-space-gold cluster"
+            echo "K8S_CONTEXT=arn:aws:eks:me-central-1:857520607940:cluster/space-gold-eks-cluster" >> $GITHUB_ENV
+          fi
+
+      - name: Audit Action 🔍
+        run: |
+          echo ' 👨‍🎓 ${{ env.user }} is going to run the management command "${{ inputs.input }}" on ${{ env.environment }} cluster for service ${{ env.service_name}}. Justification: ${{ inputs.justification }}'
+
+      - name: Slack notification 🔔
+        uses: dbz/action-slack-notify@main
+        env:
+          SLACK_USERNAME: Shell executer auditor
+          SLACK_WEBHOOK: ${{ secrets.SHELL_EXECUTER_SLACK_WEBHOOK }}
+          SLACK_CHANNEL: '#shell-executer'
+          SLACK_COLOR: '#FFFF00'
+          SLACK_LINK_NAMES: true
+          SLACK_MESSAGE: '👨‍🎓 ${{ env.user }} is going to run the management command "${{ inputs.input }}" on ${{ env.environment }} cluster for service ${{ env.service_name}}. Justification: ${{ inputs.justification }}'
+
+      - name: Fetch Workflow ID and set Job Name🎣
+        run: |
+          workflow_id=${GITHUB_RUN_ID}
+          echo $workflow_id
+          echo "workflow_id=$workflow_id" >> $GITHUB_ENV
+
+          job_name=${{ env.cronjob_name }}-${{ env.user }}-$workflow_id
+
+          # Job name should not exceed 63 characters
+          if [[ ${#job_name} -gt 63 ]]; then
+            job_name=${job_name:0:63}
+          fi
+
+          echo $job_name
+          echo "job_name=$job_name" >> $GITHUB_ENV
+
+      - name: Configure AWS Credentials 🤐
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-skip-session-tagging: true
+          aws-region: eu-west-1
+          role-to-assume: "${{env.ROLE_TO_ASSUME}}"
+          role-duration-seconds: 21600
+
+      - name: Install Kubectl ⬇️
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+
+      - name: Configure Kubectl 🔐
+        uses: azure/k8s-set-context@v3
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.KUBE_CONFIG }}
+          context: ${{ env.K8S_CONTEXT }}
+
+      - name: Shell Command Execution 🐚
+        run: |
+          # Adding && sleep 60 for the logger container to ship all logs in case of high density log applications
+          export COMMAND_PLACEHOLDER="${{ env.command }} && sleep 60"
+          kubectl create job ${{ env.job_name }} --from cronjob/${{ env.cronjob_name }} -n ${{ env.environment }} --dry-run=client --output yaml | envsubst '${COMMAND_PLACEHOLDER}' | kubectl create -f -
+          sleep 10s
+
+          POD_NAME=$(kubectl get pods -l job-name=${{ env.job_name }} -n ${{ env.environment }} -o jsonpath='{.items[0].metadata.name}')
+          echo "POD_NAME=$POD_NAME" >> $GITHUB_ENV
+          echo $POD_NAME
+
+          kubectl logs -f $POD_NAME -c application -n ${{ env.environment }}
+
+      - name: Check Job Status 🔍
+        id: job-status
+        run: |
+          # Get the job description
+          job_status=$(kubectl describe job ${{ env.job_name }} -n ${{ env.environment }})
+          echo $job_status
+
+          # Get the number of failed pods
+          failed_count=$(echo "$job_status" | grep "Pods Statuses" | awk '{print $(NF-1)}')
+          echo "Failed Count: $failed_count"
+
+          # Check if number of failed pods > 0
+          if [ "$failed_count" -gt 0 ]; then
+            echo "There are $failed_count failed pods. Skipping job deletion to allow further debugging."
+            exit 1
+          else
+            echo "No failed pods."
+          fi
+
+      - name: Slack Notification on Job Failure 🔔
+        if: failure() && steps.job-status.outcome != 'success'
+        uses: dbz/action-slack-notify@main
+        env:
+          SLACK_USERNAME: Shell executer auditor
+          SLACK_WEBHOOK: ${{ secrets.SHELL_EXECUTER_SLACK_WEBHOOK }}
+          SLACK_CHANNEL: '#shell-executer'
+          SLACK_COLOR: '#FF0000'
+          SLACK_LINK_NAMES: true
+          SLACK_MESSAGE: 'Hey ${{ env.user }}! Job ${{ env.job_name }} failed on ${{ env.environment }} cluster for service ${{ env.service_name}}. Please take a look 👀'
+
+      - name: Delete job 🗑️
+        if: success() || (failure() && steps.job-status.outcome != 'failure')
+        run: |
+          kubectl delete job ${{ env.job_name }} -n ${{ env.environment }}

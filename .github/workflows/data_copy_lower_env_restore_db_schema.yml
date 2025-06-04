@@ -1,0 +1,222 @@
+name: Data-Copy | Lower-Env | RESTORE-DB-SCHEMA
+
+on:
+  workflow_dispatch:
+    inputs:
+      Environment:
+        description: 'Select an environment to restore schema dump'
+        required: true
+        type: choice
+        options: ['beta-cc', 'beta-me', 'beta-nl', 'beta-pro', 'beta-pw', 'beta-bid', 'beta-red']
+      SOURCE_S3_BUCKET:
+        description: 'Select S3 bucket source to restore schema dump in selected environment'
+        required: true
+        type: choice
+        options: ['dbz-data-copy-test','dbz-data-copy-prod']
+
+  workflow_call:
+    inputs:
+      Environment:
+        description: 'Select an environment to restore schema dump'
+        required: true
+        type: string
+      SOURCE_S3_BUCKET:
+        description: 'Select S3 bucket source to restore schema dump in selected environment'
+        required: true
+        type: string
+
+env:
+    MYSQL_CLIENT_POD_NAME_PREFIX: "data-copy-mysql-client"
+    POSTGRESQL_CLIENT_POD_NAME_PREFIX: "data-copy-postgresql-client"
+    POD_WAIT_TIME_IN_SECONDS: 10
+
+jobs:
+
+  restore-db-schema-job:
+    runs-on: [self-hosted, dbz-runner-amd-v2-small]
+    steps:
+
+    - name: Clean Container
+      uses: dbz/actions-clean@v2
+
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        clean: true
+
+    - name: Intialize Env
+      run: |
+        if [[ ${{inputs.Environment}} == beta-* ]]; then
+          echo "K8S_CONTEXT=arn:aws:eks:eu-west-1:857520607940:cluster/beta-eks-cluster" >> $GITHUB_ENV
+          echo "ROLE_TO_ASSUME=arn:aws:iam::857520607940:role/CrossAccount_EKS_for_MENAOps" >> $GITHUB_ENV
+          SOURCE_S3_BUCKET="${{inputs.SOURCE_S3_BUCKET}}"
+          echo "SOURCE_S3_BUCKET=${SOURCE_S3_BUCKET}" >> $GITHUB_ENV
+        else
+            echo "Wrong/Invalid Environment"
+            exit 1
+        fi
+
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-skip-session-tagging: true
+        aws-region: eu-west-1
+        role-to-assume: "${{env.ROLE_TO_ASSUME}}"
+        role-duration-seconds: 3600
+
+    - name: Install Kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'v1.28.0'
+
+    - name: Configure Kubectl
+      uses: azure/k8s-set-context@v3
+      with:
+        method: kubeconfig
+        kubeconfig: ${{ secrets.KUBE_CONFIG }}
+        context: ${{ env.K8S_CONTEXT }}
+
+    - name: Restore DB Schema
+      run: |
+
+        get_services_array() {
+            local services=()
+            local skip_headers=1
+            while IFS=, read -r TARGETED_SERVICES || [ -n "$TARGETED_SERVICES" ]
+            do
+                if ((skip_headers))
+                then
+                    ((skip_headers--))
+                else
+                    services+=("$TARGETED_SERVICES")
+                fi
+            done < ./data_copy_inputfiles/dbs/targeted_services.csv
+            echo "${services[@]}"
+            }
+
+        IFS=' '
+        services_array=$(get_services_array)
+        
+        read -r -a services <<< "$services_array"
+        
+        # Check current context!
+        kubectl config get-contexts | grep "*"
+
+        BEFORE_IMPORT_MYSQL_DB="SET FOREIGN_KEY_CHECKS=0;"
+        AFTER_IMPORT_MYSQL_DB="SET FOREIGN_KEY_CHECKS=1;"
+
+        ROOT_BACKUP_DIR=root_schema_backup/
+        mkdir -p ./${ROOT_BACKUP_DIR}
+        aws s3 cp s3://$SOURCE_S3_BUCKET ./${ROOT_BACKUP_DIR} --recursive --exclude "backup/*"
+
+        for service in "${services[@]}"; do
+            echo "Service Name is $service"
+            
+            # Get data-copy env specific secrets
+            rds_secret_result=$(aws secretsmanager get-secret-value --secret-id data-copy-secrets/${{inputs.Environment}}/${service} | jq -r '.SecretString| fromjson')
+            rds_host=$(echo $rds_secret_result | jq -r '.DATABASE_HOST')
+            rds_username=$(echo $rds_secret_result | jq -r '.DATABASE_USER')
+            rds_password=$(echo $rds_secret_result | jq -r '.DATABASE_PASSWORD')
+            rds_db=$(echo $rds_secret_result | jq -r '.DATABASE_NAME')
+            rds_engine=$(echo $rds_secret_result | jq -r '.DATABASE_ENGINE')
+
+            MYSQL_CLIENT_POD_NAME=${MYSQL_CLIENT_POD_NAME_PREFIX}-${{inputs.Environment}}
+            POSTGRESQL_CLIENT_POD_NAME=${POSTGRESQL_CLIENT_POD_NAME_PREFIX}-${{inputs.Environment}}
+
+            BACKUP_DIR=root_schema_backup/backup-and-restore-schema-only-${service}/
+            mkdir -p ./${BACKUP_DIR}
+
+            if [[ "$rds_engine" = "mysql" ]]; then
+
+                # Create MySQL Client Pod
+                pod_exist=$(kubectl get pods -n infra | grep $MYSQL_CLIENT_POD_NAME | { grep -v grep || true; } )
+                if [[ -z "$pod_exist" ]]; then
+                    kubectl run -n infra $MYSQL_CLIENT_POD_NAME --image=mysql --restart=Never --env=MYSQL_ALLOW_EMPTY_PASSWORD=true
+                    sleep $POD_WAIT_TIME_IN_SECONDS
+                fi
+
+                if [[ "$service" = "monolith" ]]; then
+                  # Find the corresponding dump file
+                  # Make sure to change file format if dump is in different format
+                  DUMP_FILE=$(ls -1 "${BACKUP_DIR}${rds_db}-schema-only-"*.tar.gz 2>/dev/null | head -n 1)
+                  if [[ -z "$DUMP_FILE" ]]; then
+                      echo "No dump file found for DB '${service}'."
+                      continue
+                  fi
+                  
+                  # Restore the DB from the dump file
+                  echo "Restoring DB '${service}' from dump file '$DUMP_FILE'..."
+                  DECOMPRESSED_BACKUP_DIR=decompressed_backup_directory
+                  # Create the database if it doesn't exist
+                  kubectl exec -n infra -it $MYSQL_CLIENT_POD_NAME -- mysqlsh --host=$rds_host --user=$rds_username --password=$rds_password --execute="CREATE DATABASE IF NOT EXISTS ${rds_db};" --verbose
+                  # kubectl exec -n infra -it $MYSQL_CLIENT_POD_NAME -- rm -rf ./${BACKUP_DIR}   # clean previous backup directory in pod if present 
+                  # kubectl exec -n infra -it $MYSQL_CLIENT_POD_NAME -- mkdir -p ./${BACKUP_DIR}
+                  # kubectl cp -n infra ./${DUMP_FILE} $MYSQL_CLIENT_POD_NAME:${DUMP_FILE} --retries 5 --v=4
+                  # kubectl exec -n infra -it $MYSQL_CLIENT_POD_NAME -- mkdir -p ./${BACKUP_DIR}${DECOMPRESSED_BACKUP_DIR}/
+                  # kubectl exec -n infra -it $MYSQL_CLIENT_POD_NAME -- tar -xzvf ./${DUMP_FILE} -C ./${BACKUP_DIR}${DECOMPRESSED_BACKUP_DIR}/
+                  # echo "kubectl exec -n infra -it $MYSQL_CLIENT_POD_NAME -- mysqlsh --host=$rds_host --user=$rds_username --password=xxxxxxxxxxx --js --execute=\"util.loadDump('./${BACKUP_DIR}${DECOMPRESSED_BACKUP_DIR}/', {schema: '${rds_db}', threads: 8, progressFile: '', dryRun: false});\" --verbose"
+                  # kubectl exec -n infra -it $MYSQL_CLIENT_POD_NAME -- mysqlsh --host=$rds_host --user=$rds_username --password=$rds_password --js --execute="util.loadDump('./${BACKUP_DIR}${DECOMPRESSED_BACKUP_DIR}/', {schema: '${rds_db}', threads: 8, progressFile: '', dryRun: false});" --verbose # util.loadDump() failing with some ambiguous error
+
+                  # Below code is hack to make use of dump files created from mysql shell's util.dumpSchemas() function because mysql shell's util.loadDump() function is failing with some ambiguous error.
+                  mkdir -p ./${BACKUP_DIR}${DECOMPRESSED_BACKUP_DIR}/
+                  tar -xzf ./${DUMP_FILE} -C ./${BACKUP_DIR}${DECOMPRESSED_BACKUP_DIR}/
+                  sleep 5
+                  # Restore Main DB file (Main DB file can also have CHARACTER SET and FUNCTION definition)
+                  kubectl exec -n infra -it $MYSQL_CLIENT_POD_NAME -- mysql --host=$rds_host --user=$rds_username --password=$rds_password --verbose < ./${BACKUP_DIR}${DECOMPRESSED_BACKUP_DIR}/${rds_db}.sql
+                  temp_combined_dump_output_file="./${BACKUP_DIR}${rds_db}_$(date '+%Y%m%d%H%M%S')_${RANDOM}.sql"
+                  echo "$BEFORE_IMPORT_MYSQL_DB" >> $temp_combined_dump_output_file && \
+                  find "./${BACKUP_DIR}${DECOMPRESSED_BACKUP_DIR}" -type f -name "${rds_db}@*.sql" -print0 | sort -z | xargs -0 cat >> "$temp_combined_dump_output_file" && \
+                  echo "$AFTER_IMPORT_MYSQL_DB" >> $temp_combined_dump_output_file && \
+                  sed -i.old -e 's/\DEFINER\=`[^`]*`@`[^`]*`//g' $temp_combined_dump_output_file # Remove the DEFINER clause using sed for views
+                  sleep 5
+                  # Restore Tables file 
+                  kubectl exec -n infra -it $MYSQL_CLIENT_POD_NAME -- mysql --host=$rds_host --user=$rds_username --password=$rds_password ${rds_db} --verbose < $temp_combined_dump_output_file
+
+                else           
+                  # Find the corresponding dump file
+                  # Make sure to change file format if dump is in different format
+                  DUMP_FILE=$(ls -1 "${BACKUP_DIR}${rds_db}-schema-only-"*.sql 2>/dev/null | head -n 1)
+                  if [[ -z "$DUMP_FILE" ]]; then
+                      echo "No dump file found for DB '${service}'."
+                      continue
+                  fi
+
+                  # Restore the DB from the dump file
+                  echo "Restoring DB '${service}' from dump file '$DUMP_FILE'..."
+                  # Create the database if it doesn't exist
+                  kubectl exec -n infra -it $MYSQL_CLIENT_POD_NAME -- mysql --host=$rds_host --user=$rds_username --password=$rds_password --execute="CREATE DATABASE IF NOT EXISTS ${rds_db};"
+                  echo "kubectl exec -n infra -it $MYSQL_CLIENT_POD_NAME -- mysql --host=$rds_host --user=$rds_username --password=xxxxxxxxxxx ${rds_db} --verbose < ./${DUMP_FILE}"
+                  kubectl exec -n infra -it $MYSQL_CLIENT_POD_NAME -- mysql --host=$rds_host --user=$rds_username --password=$rds_password ${rds_db} --verbose < ./${DUMP_FILE}
+                fi
+
+            elif [[ "$rds_engine" = "postgresql" ]]; then
+                
+                # Create PostgreSQL Client Pod
+                pod_exist=$(kubectl get pods -n infra | grep $POSTGRESQL_CLIENT_POD_NAME | { grep -v grep || true; } )
+                if [[ -z "$pod_exist" ]]; then
+                    kubectl run -n infra $POSTGRESQL_CLIENT_POD_NAME --image=postgres --restart=Never --env=POSTGRES_PASSWORD=mysecretpassword
+                    sleep $POD_WAIT_TIME_IN_SECONDS
+                fi
+
+                # Find the corresponding dump file
+                # Make sure to change file format if dump is in different format
+                DUMP_FILE=$(ls -1 "${BACKUP_DIR}${rds_db}-schema-only-"*.sql 2>/dev/null | head -n 1)
+                if [[ -z "$DUMP_FILE" ]]; then
+                    echo "No dump file found for DB '${service}'."
+                    continue
+                fi
+
+                # Restore the DB from the dump file
+                echo "Restoring DB '${service}' from dump file '$DUMP_FILE'..."
+                kubectl exec -n infra -it $POSTGRESQL_CLIENT_POD_NAME -- rm -rf ./${BACKUP_DIR}   # clean previous backup directory in pod if present 
+                kubectl exec -n infra -it $POSTGRESQL_CLIENT_POD_NAME -- mkdir -p ./${BACKUP_DIR}
+                sql_query="SELECT 'CREATE DATABASE ${rds_db}' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '${rds_db}')\gexec"
+                password_concatenated_query="$rds_password"$'\n'"$sql_query"
+                kubectl exec -n infra -it $POSTGRESQL_CLIENT_POD_NAME -- psql -h $rds_host -U $rds_username -W -d postgres -b -v VERBOSITY=verbose <<< "$password_concatenated_query"
+                kubectl cp -n infra ./${DUMP_FILE} $POSTGRESQL_CLIENT_POD_NAME:${DUMP_FILE}
+                echo "kubectl exec -n infra -it $POSTGRESQL_CLIENT_POD_NAME -- psql -h $rds_host -U $rds_username -W -d ${rds_db} -b -v VERBOSITY=verbose -f ./${DUMP_FILE} <<< \"xxxxxxxxxxx\" "
+                kubectl exec -n infra -it $POSTGRESQL_CLIENT_POD_NAME -- psql -h $rds_host -U $rds_username -W -d ${rds_db} -b -v VERBOSITY=verbose -f ./${DUMP_FILE} <<< "$rds_password"
+
+            fi
+
+        done

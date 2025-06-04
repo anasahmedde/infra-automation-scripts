@@ -1,0 +1,10 @@
+TARGETED_SERVICES
+chat-service
+favorites-service
+horizontal-buyer-service
+location-service
+monolith
+property-lpv-service
+savedsearch-service
+seller-service
+tx-service

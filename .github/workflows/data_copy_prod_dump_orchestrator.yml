@@ -1,0 +1,24 @@
+name: Data-Copy | Prod | Dump-Orchestrator
+
+on:
+  workflow_dispatch:
+    inputs:
+      Environment:
+        description: 'Select an environment to dump [schema + data]'
+        required: true
+        type: choice
+        options: ['beta-cc', 'prod']
+
+jobs:
+
+  DUMP_DB_SCHEMA_PIPELINE:
+    uses: dbz/infra-automation/.github/workflows/data_copy_prod_dump_db_schema.yml@main
+    with:
+      Environment: ${{inputs.Environment}}
+    secrets: inherit
+
+  DUMP_TABLES_DATA_PIPELINE:
+    uses: dbz/infra-automation/.github/workflows/data_copy_prod_dump_tables_data.yml@main
+    with:
+      Environment: ${{inputs.Environment}}
+    secrets: inherit

@@ -1,0 +1,9 @@
+TARGETED_TABLES
+core_category
+core_place
+core_tag
+core_taggroup
+motors_motorstrim
+motors_platecode
+django_content_type
+django_migrations

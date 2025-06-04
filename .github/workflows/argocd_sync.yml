@@ -1,0 +1,194 @@
+name: Prod ArgoCD Sync
+
+on:
+    workflow_call:
+      inputs:
+        application:
+          required: true
+          type: string
+        action:
+          required: true
+          type: string
+
+jobs:
+
+    argocd-sync:
+        if: ${{ inputs.action == 'sync' }}
+        runs-on: [dbz-infra-runner-amd-v2]
+        steps:
+
+        - name: Clean Container 📦🧹
+          uses: dbz/actions-clean@v2
+
+        - name: Clean SSH key 🧹🔑
+          uses: JesseTG/rm@v1.0.2
+          with:
+            path: /home/ec2-user/.ssh/id_rsa
+
+        - name: Install SSH key 🔐
+          uses: shimataro/ssh-key-action@v2
+          with:
+            key: ${{ secrets.SSH_KEY }}
+            name: id_rsa
+            known_hosts: ${{ secrets.KNOWN_HOSTS }}
+
+        - name: Clone Infra-Automation 👷🏼‍♂️
+          run: |
+            git clone -b main git@github.com:dbz/infra-automation.git
+
+        - name: Initialize Logging Variables 🤖
+          run: |
+            event_payload=$(cat $GITHUB_EVENT_PATH)
+            inputs_string=$(echo "$event_payload" | jq -r '.inputs | to_entries | map("\(.key)=\(.value|tostring)") | join(",")')
+            echo "INPUT_PARAMETERS=$inputs_string" >> $GITHUB_ENV
+            echo "SERVICE_NAME=${{ inputs.application }}" >> $GITHUB_ENV
+            echo "USER=${{ github.actor }}" >> $GITHUB_ENV
+            echo "WORKFLOW_EXECUTED=${{ github.workflow }}" >> $GITHUB_ENV
+            echo "LINK_TO_EXECUTION=https://github.com/${{ github.repository }}/actions/runs/${GITHUB_RUN_ID}" >> $GITHUB_ENV
+            echo "MESSAGE=${{ github.actor }} is going to sync argoCD for service ${{ inputs.application }}" >> $GITHUB_ENV
+
+        - name: Send request to OpenSearch 📤
+          run: |
+            bash infra-automation/elk_logging/send_logs_to_elk.sh
+
+        - name: Sync ArgoCD ♻️
+          run: |
+            response=$(curl -s -w "\n%{http_code}" -X POST \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${{ secrets.ARGOCD_PROD_TOKEN }}" \
+            -d '{"dryRun": false}' \
+            "https://argo-proxy-api.dbzcloud.com/api/application/prod/${{ inputs.application }}-prod/sync")
+
+            status_code=$(echo "$response" | tail -n 1)
+            response_body=$(echo "$response" | head -n -1)
+
+            if [ $status_code -eq 200 ]; then
+                echo "SUCCEEDED: $status_code"
+                echo ${response_body}
+            else
+                echo "FAILED: $status_code"
+                echo ${response_body}
+                exit 1
+            fi
+
+        - name: Check ArgoCD Sync Status 🔍
+          run: |
+            while true; do
+                json=$(curl -s -X GET \
+                -H "Authorization: Bearer ${{ secrets.ARGOCD_PROD_TOKEN }}" \
+                -H "Content-Type: application/json" \
+                https://argo-proxy-api.dbzcloud.com/api/application/prod/${{ inputs.application }}-prod/sync)
+
+                echo $json
+                num_responses=$(echo "$json" | jq '.responses | length')
+                echo "Number of response: $num_responses"
+                for ((i = 0; i < num_responses; i++)); do
+                    phase=$(echo "$json" | jq -r ".responses[$i].Phase")
+
+                    case $phase in
+                        "Succeeded")
+                            echo "Sync status of response $((i+1)) is Succeeded"
+                            ;;
+                        "Failed")
+                            echo "Sync status of response $((i+1)) is Failed"
+                            exit 1  # Exit with error
+                            ;;
+                        "Running")
+                            echo "Sync status of response $((i+1)) is Running ..."
+                            ;;
+                        *)
+                            echo "Unknown sync status of response $((i+1)): $phase"
+                            exit 1  # Exit with error
+                            ;;
+                    esac
+                done
+                # Check if all responses have succeeded
+                all_succeeded=$(echo "$json" | jq -r '.responses[].Phase' | { grep -c "Succeeded" || echo "0"; } )
+                echo "Succeded Count is $all_succeeded"
+
+                if [ "$all_succeeded" == "$num_responses" ]; then
+                    echo "All responses have succeeded"
+                    break
+                fi
+                # Wait for 5 seconds before checking again
+                echo "Retrying in 5 seconds..."
+                sleep 5
+            done
+
+        # Install kubectl and kubectl argo cli
+
+        - name: Configure AWS Credentials 🤐
+          uses: aws-actions/configure-aws-credentials@v4
+          with:
+            role-skip-session-tagging: true
+            aws-region: eu-west-1
+            role-to-assume: "arn:aws:iam::847754352879:role/CrossAccount_EKS_for_MENAOps"
+            role-duration-seconds: 3600
+
+        - name: Install Kubectl ⬇️
+          uses: azure/setup-kubectl@v3
+          with:
+            version: 'v1.28.0'
+
+        - name: Configure Kubectl 🔐
+          uses: azure/k8s-set-context@v3
+          with:
+            method: kubeconfig
+            kubeconfig: ${{ secrets.KUBE_CONFIG }}
+            context: arn:aws:eks:eu-west-1:847754352879:cluster/prod-eks-cluster
+
+        - name: Install kubectl-argo CLI 🛠️
+          run: |
+            curl -LO https://github.com/argoproj/argo-rollouts/releases/latest/download/kubectl-argo-rollouts-linux-amd64
+            chmod +x ./kubectl-argo-rollouts-linux-amd64
+            sudo mv ./kubectl-argo-rollouts-linux-amd64 /usr/local/bin/kubectl-argo-rollouts
+            kubectl argo rollouts version
+
+        - name: Set Rollout Names 🤫
+          run: |
+            # This step handles edge cases where the service name is different from the rollout name or deployment label
+
+            echo "SERVICE_NAME=${{ inputs.application }}" >> $GITHUB_ENV
+            if [[ "${{ inputs.application }}" == "monolith" ]]; then
+              ROLLOUT=dbzuae-web
+              echo "ROLLOUT=$ROLLOUT" >> $GITHUB_ENV
+            elif [[ "${{ inputs.application }}" == "vas-dbz-cars" ]]; then
+              ROLLOUT=vas-dbz-cars-blog
+              echo "ROLLOUT=$ROLLOUT" >> $GITHUB_ENV
+            elif [[ "${{ inputs.application }}" == "horizontal-buyer-service" ]]; then
+              ROLLOUT=horizontal-buyer
+              echo "ROLLOUT=$ROLLOUT" >> $GITHUB_ENV
+            else
+              ROLLOUT=${{ inputs.application }}
+              echo "ROLLOUT=$ROLLOUT" >> $GITHUB_ENV
+            fi
+
+        - name: Check Rollout Status 👀
+          if: ${{ inputs.application != 'fenginx' && inputs.application != 'openresty' && inputs.application != 'openresty-property' && inputs.application != 'sitemaps-indexer' }}
+          run: |
+            while ! kubectl argo rollouts get rollout ${{ env.ROLLOUT }} -n prod | grep -q "Healthy"; do
+              kubectl argo rollouts get rollout ${{ env.ROLLOUT }} -n prod
+              sleep 5
+            done
+
+            echo "Rollout is Healthy!"
+
+    app-status:
+        if: ${{ inputs.action == 'check status' }}
+        runs-on: [self-hosted, dbz-runner-arm-v2-small]
+        steps:
+
+        - name: Clean Container 📦🧹
+          uses: dbz/actions-clean@v2
+
+        - name: Check Application Status 👀
+          run: |
+            response=$(curl -s -X GET \
+              -H "Authorization: Bearer ${{ secrets.ARGOCD_PROD_TOKEN }}" \
+              "https://argocd.prod.eks.dbzcloud.com/api/v1/applications/${{ inputs.application }}-prod")
+
+              sync_status=$(echo "$response" | jq -r '.status.sync.status')
+              health_status=$(echo "$response" | jq -r '.status.health.status')
+
+              echo "Sync Status: $sync_status"
+              echo "Health Status: $health_status"

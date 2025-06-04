@@ -1,0 +1,219 @@
+name: Data-Copy | Prod | DUMP-TABLES-DATA
+
+on:
+  workflow_dispatch:
+    inputs:
+      Environment:
+        description: 'Select an environment to dump data'
+        required: true
+        type: choice
+        options: ['beta-cc', 'prod']
+
+  workflow_call:
+    inputs:
+      Environment:
+        description: 'Select an environment to dump data'
+        required: true
+        type: string
+
+env:
+    MYSQL_CLIENT_POD_NAME_PREFIX: "data-copy-mysql-client"
+    POSTGRESQL_CLIENT_POD_NAME_PREFIX: "data-copy-postgresql-client"
+    DESTINATION_S3_BUCKET_PREFIX: "dbz-data-copy"
+    POD_WAIT_TIME_IN_SECONDS: 10
+
+jobs:
+
+  dump-tables-data-job:
+    runs-on: [self-hosted, dbz-runner-amd-v2-small]
+    steps:
+
+    - name: Clean Container
+      uses: dbz/actions-clean@v2
+
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        clean: true
+
+    - name: Intialize Env
+      run: |
+        if [[ "${{inputs.Environment}}" == "prod" ]]; then
+          echo "K8S_CONTEXT=arn:aws:eks:eu-west-1:847754352879:cluster/prod-eks-cluster" >> $GITHUB_ENV
+          echo "ROLE_TO_ASSUME=arn:aws:iam::847754352879:role/CrossAccount_EKS_for_MENAOps" >> $GITHUB_ENV
+          DESTINATION_S3_BUCKET=${DESTINATION_S3_BUCKET_PREFIX}-prod
+          echo "DESTINATION_S3_BUCKET=${DESTINATION_S3_BUCKET}" >> $GITHUB_ENV
+
+        elif [[ "${{inputs.Environment}}" == "beta-cc" ]]; then
+          echo "K8S_CONTEXT=arn:aws:eks:eu-west-1:857520607940:cluster/beta-eks-cluster" >> $GITHUB_ENV
+          echo "ROLE_TO_ASSUME=arn:aws:iam::857520607940:role/CrossAccount_EKS_for_MENAOps" >> $GITHUB_ENV
+          DESTINATION_S3_BUCKET=${DESTINATION_S3_BUCKET_PREFIX}-test
+          echo "DESTINATION_S3_BUCKET=${DESTINATION_S3_BUCKET}" >> $GITHUB_ENV
+  
+        else
+            echo "Wrong/Invalid Environment"
+            exit 1
+        fi
+
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-skip-session-tagging: true
+        aws-region: eu-west-1
+        role-to-assume: "${{env.ROLE_TO_ASSUME}}"
+        role-duration-seconds: 7200 # 2 hours
+
+    - name: Install Kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'v1.28.0'
+
+    - name: Configure Kubectl
+      uses: azure/k8s-set-context@v3
+      with:
+        method: kubeconfig
+        kubeconfig: ${{ secrets.KUBE_CONFIG }}
+        context: ${{ env.K8S_CONTEXT }}
+
+    - name: Shift Previous Tables Dump To a Backup Folder
+      run: |
+
+          bucket_name=${{ env.DESTINATION_S3_BUCKET }}
+
+          backup_folder="backup/backup_tables_$(date '+%Y%m%d%H%M%S')"
+
+          # List objects in the bucket recursively and store root folder names in an array
+          root_folders=($(aws s3 ls s3://$bucket_name/ --recursive --output text | awk -F'/' '{print $1}' | awk '{print $NF}' | uniq))
+
+          # Move root folders to backup folder
+          for folder in "${root_folders[@]}"; do
+
+              # Skip if the folder is already named "backup" or folder is of schema dump
+              if [[ "$folder" == "backup" || "$folder" == "backup-and-restore-schema-only"* ]]; then
+                  echo "Skipping folder \"$folder\""
+                  continue
+              fi
+              aws s3 mv "s3://$bucket_name/$folder" "s3://$bucket_name/$backup_folder/$folder" --recursive
+          done
+
+          echo "All folders shifted to backup in S3."
+
+    - name: Dump Tables
+      run: |
+
+        get_services_array() {
+            local services=()
+            local skip_headers=1
+            while IFS=, read -r TARGETED_SERVICES || [ -n "$TARGETED_SERVICES" ]
+            do
+                if ((skip_headers))
+                then
+                    ((skip_headers--))
+                else
+                    services+=("$TARGETED_SERVICES")
+                fi
+            done < ./data_copy_inputfiles/dbs/targeted_services.csv
+            echo "${services[@]}"
+            }
+
+        get_tables_array() {
+            local service=$1
+            local tables=()
+            local skip_headers=1
+            while IFS=, read -r TARGETED_TABLES || [ -n "$TARGETED_TABLES" ]
+            do
+                if ((skip_headers))
+                then
+                    ((skip_headers--))
+                else
+                    tables+=("$TARGETED_TABLES")
+                fi
+            done < ./data_copy_inputfiles/tables/${service}_tables.csv
+            echo "${tables[@]}"
+            }
+
+        IFS=' '
+        services_array=$(get_services_array)
+        
+        read -r -a services <<< "$services_array"
+        
+        # Check current context!
+        kubectl config get-contexts | grep "*"
+
+        for service in "${services[@]}"; do
+            echo "Service Name is $service"
+            
+            # Get data-copy env specific secrets
+            rds_secret_result=$(aws secretsmanager get-secret-value --secret-id data-copy-secrets/${{inputs.Environment}}/${service} | jq -r '.SecretString| fromjson')
+            rds_host=$(echo $rds_secret_result | jq -r '.DATABASE_HOST')
+            rds_username=$(echo $rds_secret_result | jq -r '.DATABASE_USER')
+            rds_password=$(echo $rds_secret_result | jq -r '.DATABASE_PASSWORD')
+            rds_db=$(echo $rds_secret_result | jq -r '.DATABASE_NAME')
+            rds_engine=$(echo $rds_secret_result | jq -r '.DATABASE_ENGINE')
+
+            MYSQL_CLIENT_POD_NAME=${MYSQL_CLIENT_POD_NAME_PREFIX}-${{inputs.Environment}}
+            POSTGRESQL_CLIENT_POD_NAME=${POSTGRESQL_CLIENT_POD_NAME_PREFIX}-${{inputs.Environment}}
+            DESTINATION_S3_BUCKET=${{ env.DESTINATION_S3_BUCKET }}
+
+            TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
+            BACKUP_DIR=root_backup/backup-and-restore-tables-${service}/
+            mkdir -p ./${BACKUP_DIR}
+
+            if [[ "$rds_engine" = "mysql" ]]; then
+
+                # Create MySQL Client Pod
+                pod_exist=$(kubectl get pods -n infra | grep $MYSQL_CLIENT_POD_NAME | { grep -v grep || true; } )
+                if [[ -z "$pod_exist" ]]; then
+                    kubectl run -n infra $MYSQL_CLIENT_POD_NAME --image=mysql --restart=Never --env=MYSQL_ALLOW_EMPTY_PASSWORD=true
+                    sleep $POD_WAIT_TIME_IN_SECONDS
+                fi
+
+                tables_array=$(get_tables_array "$service")
+                IFS=' '
+                
+                read -r -a tables <<< "$tables_array"
+
+                for table in "${tables[@]}"; do
+                    echo "Table Name $table for Service $service"
+                    kubectl exec -n infra -it $MYSQL_CLIENT_POD_NAME -- mysqldump --host=$rds_host --user=$rds_username --password=$rds_password ${rds_db} ${table} --no-create-info --skip-add-drop-table --skip-set-charset --skip-comments --set-gtid-purged=OFF --verbose > ./${BACKUP_DIR}${rds_db}-${table}-${TIMESTAMP}.sql
+                done
+
+            elif [[ "$rds_engine" = "postgresql" ]]; then
+                
+                # Create PostgreSQL Client Pod
+                pod_exist=$(kubectl get pods -n infra | grep $POSTGRESQL_CLIENT_POD_NAME | { grep -v grep || true; } )
+                if [[ -z "$pod_exist" ]]; then
+                    kubectl run -n infra $POSTGRESQL_CLIENT_POD_NAME --image=postgres --restart=Never --env=POSTGRES_PASSWORD=mysecretpassword
+                    sleep $POD_WAIT_TIME_IN_SECONDS
+                fi
+
+                tables_array=$(get_tables_array "$service")
+                IFS=' '
+                
+                read -r -a tables <<< "$tables_array"
+
+                for table in "${tables[@]}"; do
+                    echo "Table Name $table for Service $service"
+                    kubectl exec -n infra -it $POSTGRESQL_CLIENT_POD_NAME -- rm -rf ./${BACKUP_DIR}   # clean previous backup directory in pod if present 
+                    kubectl exec -n infra -it $POSTGRESQL_CLIENT_POD_NAME -- mkdir -p ./${BACKUP_DIR}
+                    kubectl exec -n infra -it $POSTGRESQL_CLIENT_POD_NAME -- pg_dump -h $rds_host -U $rds_username -W -d ${rds_db} -t ${table} -a -v -f ./${BACKUP_DIR}${rds_db}-${table}-${TIMESTAMP}.sql <<< "$rds_password"
+                    kubectl cp -n infra $POSTGRESQL_CLIENT_POD_NAME:${BACKUP_DIR}${rds_db}-${table}-${TIMESTAMP}.sql ./${BACKUP_DIR}${rds_db}-${table}-${TIMESTAMP}.sql
+                done
+
+            fi
+
+            du -ah ./root_backup
+
+            aws s3 cp ./root_backup s3://$DESTINATION_S3_BUCKET/ --recursive
+            # Capture the exit code of the aws s3 cp command
+            exit_code=$?
+
+            # Check if the command failed or succeeded
+            if [ $exit_code -eq 0 ]; then
+                echo "S3 copy successful"
+                rm -rf ./${BACKUP_DIR}
+            else
+                echo "S3 copy failed"
+            fi
+
+        done

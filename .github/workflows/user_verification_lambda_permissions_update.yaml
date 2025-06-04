@@ -1,0 +1,65 @@
+name: User Verification Lambda Permissions Modification
+# This workflow is temporarily used to add permission on user-verification lambda to be called from ALB
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: false
+        default: 'prod'
+        type: string
+        
+jobs:
+
+  lambda-add-permission:
+    # runs-on: [self-hosted, dbz-runner-amd-v2-small] #use this runner for testing changes
+    runs-on: [self-hosted, dbz-infra-runner-amd-v2]
+
+    steps:
+      - name: Clean Container 📦🧹
+        uses: dbz/actions-clean@v2
+
+      - name: Clean SSH key 🧹🔑
+        uses: JesseTG/rm@v1.0.2
+        with:
+          path: /home/ec2-user/.ssh/id_rsa
+
+      - name: Install SSH key 🔐
+        uses: shimataro/ssh-key-action@v2
+        with:
+          key: ${{ secrets.SSH_KEY }}
+          name: id_rsa
+          known_hosts: ${{ secrets.KNOWN_HOSTS }}
+
+      - name: Intialize Environment Specific Variables 🪴
+        run: |
+          # This step initializes environment dependent variables
+          if [[ "${{ inputs.environment }}" == "prod" ]]; then
+            echo "ROLE_TO_ASSUME=arn:aws:iam::847754352879:role/CrossAccount_EKS_for_MENAOps" >> $GITHUB_ENV
+          else
+            echo "ROLE_TO_ASSUME=arn:aws:iam::857520607940:role/CrossAccount_EKS_for_MENAOps" >> $GITHUB_ENV
+          fi
+
+      - name: Configure AWS Credentials 🤐
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-skip-session-tagging: true
+          aws-region: eu-west-1
+          role-to-assume: "${{env.ROLE_TO_ASSUME}}"
+          role-duration-seconds: 14400
+    
+      - name: Add ALB Allow Permission to User Verification Lambda
+        run: |
+            timestamp=$(date +%s)
+            if [[ "${{ inputs.environment }}" == "prod" ]]; then
+                aws lambda add-permission --function-name verification-service-prod \
+                --region me-central-1 \
+                --action lambda:InvokeFunction --statement-id verification-service-alb-$timestamp \
+                --principal elasticloadbalancing.amazonaws.com \
+                --source-arn arn:aws:elasticloadbalancing:me-central-1:847754352879:targetgroup/verification-service-prod-tg/*
+            else
+                aws lambda add-permission --function-name verification-service-staging \
+                --region me-central-1 \
+                --action lambda:InvokeFunction --statement-id verification-service-alb-$timestamp \
+                --principal elasticloadbalancing.amazonaws.com \
+                --source-arn arn:aws:elasticloadbalancing:me-central-1:857520607940:targetgroup/user-verification-staging/*
+            fi
